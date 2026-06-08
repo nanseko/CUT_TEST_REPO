@@ -178,10 +178,17 @@ def run_pipeline(config, max_preview=12):
                 s.params.get('mode') == 'unpaired_optical_reference':
             ref = s.params.get('optical_reference_dir')
             yield log(f'optical reference CDF 생성 중: {ref}'), previews
-            optical_target = build_optical_reference_cdf(
-                ref, int(s.params.get('bins', 1024)))
+            try:
+                optical_target = build_optical_reference_cdf(
+                    ref, int(s.params.get('bins', 1024)))
+            except Exception:
+                optical_target = None
+                yield log('경고: optical reference CDF 생성 실패 -> sar_only로 대체\n'
+                          + traceback.format_exc().splitlines()[-1]), previews
             if optical_target is None:
                 yield log('경고: optical reference를 찾지 못해 sar_only(optical_like_v1)로 대체'), previews
+            else:
+                yield log(f'optical reference CDF 생성 완료 (bins={len(optical_target[0])})'), previews
 
     # manifest
     mf = open(manifest_path, 'w', newline='')
@@ -196,6 +203,7 @@ def run_pipeline(config, max_preview=12):
         t0 = time.time()
         ctx = {'input_path': path, 'optical_target': optical_target,
                'stats': {}, 'skip': False}
+        failed = False
         try:
             raw = _load_gray(path)
             oh, ow = raw.shape[:2]
@@ -203,7 +211,12 @@ def run_pipeline(config, max_preview=12):
             for s in steps:
                 if not s.enabled:
                     continue
-                img, ctx = s.apply(img, ctx)
+                try:
+                    img, ctx = s.apply(img, ctx)
+                except Exception as exc:
+                    # surface which step failed (the silent manifest-only error
+                    # made pipeline failures impossible to diagnose from the UI)
+                    raise RuntimeError(f"step '{s.name}' 실패: {exc}") from exc
                 if ctx.get('skip'):
                     break
             name = os.path.splitext(os.path.basename(path))[0]
@@ -229,9 +242,20 @@ def run_pipeline(config, max_preview=12):
                              round(float(p99), 3), round(float(p998), 3),
                              round(zero_ratio, 4), round(time.time() - t0, 3)])
             ok += 1
+        except Exception:
+            failed = True
+            fail += 1
+            err = traceback.format_exc().splitlines()[-1]
+            writer.writerow([path, '', 'failed', err,
+                             '', '', '', '', '|'.join(enabled_names), '', '', '', '', '',
+                             round(time.time() - t0, 3)])
+            # show the real error in the streamed log, not only in manifest.csv
+            yield log(f'실패: {os.path.basename(path)} -> {err}'), previews[-max_preview:]
 
-            # preview (before/after) for first N
-            if len(previews) < max_preview:
+        # preview (before/after) for first N successful images; isolated so a
+        # preview problem never marks an otherwise-good image as failed.
+        if not failed and len(previews) < max_preview:
+            try:
                 before = (np.clip(_safe_gray01(raw), 0, 1) * 255).astype(np.uint8)
                 bH = arr.shape[0]
                 before = np.asarray(Image.fromarray(before).resize((bH, bH)))
@@ -239,11 +263,8 @@ def run_pipeline(config, max_preview=12):
                 pv = os.path.join(prev_dir, f'{name}_ba.png')
                 Image.fromarray(pair).save(pv)
                 previews.append(pv)
-        except Exception:
-            fail += 1
-            writer.writerow([path, '', 'failed', traceback.format_exc().splitlines()[-1],
-                             '', '', '', '', '|'.join(enabled_names), '', '', '', '', '',
-                             round(time.time() - t0, 3)])
+            except Exception:
+                pass
 
         if (i + 1) % 5 == 0 or i == 0 or i == len(files) - 1:
             yield log(f'처리 {i+1}/{len(files)}  현재: {os.path.basename(path)}  '
