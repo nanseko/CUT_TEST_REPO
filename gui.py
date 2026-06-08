@@ -75,10 +75,11 @@ CONFIG_KEYS = [
     # 3. Basic training params
     'CUT_mode', 'n_epochs', 'n_epochs_decay', 'batch_size', 'lr',
     'beta1', 'beta2', 'save_epoch_freq', 'load_size', 'crop_size', 'num_threads',
+    'continue_train',
     # 4. CUT params
     'netG', 'normG', 'gan_mode', 'netF', 'netF_nc', 'num_patches', 'nce_T',
     'nce_layers', 'lambda_GAN', 'lambda_NCE', 'nce_idt',
-    'no_antialias', 'no_antialias_up', 'lambda_grad', 'lambda_color',
+    'no_antialias', 'no_antialias_up', 'lambda_grad', 'lambda_color', 'serial_batches',
     # 5. Attention params
     'attention_type', 'attention_reduction',
     'attention_encoder', 'attention_resblocks', 'attention_decoder',
@@ -101,6 +102,7 @@ DEFAULTS = {
     'load_size': 286,
     'crop_size': 256,
     'num_threads': 4,
+    'continue_train': False,
     'netG': 'resnet_9blocks',
     'normG': 'instance',
     'gan_mode': 'lsgan',
@@ -116,6 +118,7 @@ DEFAULTS = {
     'no_antialias_up': False,
     'lambda_grad': 0.0,
     'lambda_color': 0.0,
+    'serial_batches': False,
     'attention_type': 'none',
     'attention_reduction': 16,
     'attention_encoder': False,
@@ -269,6 +272,39 @@ def _attention_args(cfg):
     return args
 
 
+def _find_last_epoch(checkpoints_dir, name):
+    """Largest N from '<N>_net_G.pth' under checkpoints_dir/name (None if absent)."""
+    d = os.path.join(str(checkpoints_dir), str(name))
+    if not os.path.isdir(d):
+        return None
+    epochs = []
+    for f in os.listdir(d):
+        m = re.match(r'(\d+)_net_G\.pth$', f)
+        if m:
+            epochs.append(int(m.group(1)))
+    return max(epochs) if epochs else None
+
+
+def _resume_args(cfg):
+    """Build --continue_train args to resume from the last saved epoch.
+
+    Returns (args, message). args is [] when resume was requested but no
+    checkpoint exists (-> start fresh).
+    """
+    if not _bool(cfg.get('continue_train')):
+        return [], None
+    ckpt = str(cfg['checkpoints_dir'])
+    name = str(cfg['name'])
+    last = _find_last_epoch(ckpt, name)
+    if last is not None:
+        return (['--continue_train', '--epoch', str(last), '--epoch_count', str(last + 1)],
+                f'이어서 학습: epoch {last} 체크포인트에서 재개 -> epoch {last+1} 부터')
+    if os.path.exists(os.path.join(ckpt, name, 'latest_net_G.pth')):
+        return (['--continue_train', '--epoch', 'latest', '--epoch_count', '1'],
+                '이어서 학습: 번호 체크포인트가 없어 latest 가중치로 재개 (epoch 카운트는 1부터)')
+    return [], '이어서 학습 요청됨 — 체크포인트를 찾지 못해 처음부터 학습합니다.'
+
+
 def build_train_cmd(cfg):
     cmd = [sys.executable, '-u', os.path.join(REPO_ROOT, 'train.py'),
            '--dataroot', str(cfg['dataroot']),
@@ -301,6 +337,11 @@ def build_train_cmd(cfg):
            '--lambda_grad', str(float(cfg['lambda_grad'])),
            '--lambda_color', str(float(cfg['lambda_color'])),
            '--display_id', '0']    # disable visdom; we stream the console log
+    if _bool(cfg.get('serial_batches')):
+        # pair real_A[i] with real_B[i] by sorted order (for aligned SAR/optical
+        # sets); default CUT samples real_B randomly (unpaired, by design).
+        cmd.append('--serial_batches')
+    cmd += _resume_args(cfg)[0]
     cmd += _attention_args(cfg)
     return cmd
 
@@ -418,6 +459,26 @@ def start_training(cfg_path, *values):
         log_dir, f'gui_train_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}.log')
     STATE.running = True
     STATE.message = '학습 준비 중...'
+
+    # preflight: show exactly which folders will be loaded so a train/test or
+    # A/B folder mix-up is obvious (training reads trainA/trainB).
+    dataroot = str(cfg['dataroot'])
+    counts = {sub: len(list_images(os.path.join(dataroot, sub)))
+              for sub in ('trainA', 'trainB', 'testA', 'testB')}
+    STATE.log(f'dataroot = {os.path.abspath(dataroot)}')
+    STATE.log('폴더 이미지 수 -> ' + ', '.join(f'{k}={v}' for k, v in counts.items()))
+    STATE.log(f'학습은 trainA({counts["trainA"]}) -> trainB({counts["trainB"]}) 를 사용합니다 '
+              f'(testA/testB 는 추론용).')
+    if counts['trainA'] == 0 or counts['trainB'] == 0:
+        STATE.log('오류: trainA 또는 trainB 가 비어 있습니다. dataroot 아래 trainA/trainB 폴더를 확인하세요.')
+        STATE.running = False
+        STATE.message = '오류: 학습 폴더 비어 있음'
+        yield _format_status(STATE.snapshot())
+        return
+
+    resume_msg = _resume_args(cfg)[1]
+    if resume_msg:
+        STATE.log(resume_msg)
 
     thread = threading.Thread(target=training_worker, args=(cfg, STATE), daemon=True)
     thread.start()
@@ -1229,6 +1290,13 @@ def build_ui():
             with gr.Row():
                 comp['load_size'] = gr.Number(cfg['load_size'], label='load_size', precision=0)
                 comp['crop_size'] = gr.Number(cfg['crop_size'], label='crop_size', precision=0)
+            comp['continue_train'] = gr.Checkbox(
+                bool(cfg['continue_train']),
+                label='이어서 학습 (continue_train) — 마지막 저장된 epoch 체크포인트에서 재개')
+            gr.Markdown(
+                'ℹ️ 체크 시 `checkpoints_dir/name` 의 마지막 `<N>_net_*.pth` 를 불러와 '
+                'epoch N+1 부터 이어서 학습합니다(설정은 학습 때와 동일해야 함). '
+                '체크포인트는 `save_epoch_freq` epoch마다 저장됩니다.')
             save_basic = gr.Button('💾 기본 파라미터 저장', variant='primary')
             save_basic_out = gr.Textbox(label='', interactive=False)
 
@@ -1256,6 +1324,14 @@ def build_ui():
             with gr.Row():
                 comp['no_antialias'] = gr.Checkbox(bool(cfg['no_antialias']), label='no_antialias (다운샘플 stride2)')
                 comp['no_antialias_up'] = gr.Checkbox(bool(cfg['no_antialias_up']), label='no_antialias_up')
+            comp['serial_batches'] = gr.Checkbox(
+                bool(cfg['serial_batches']),
+                label='serial_batches (정렬된 짝 데이터: real_A[i]↔real_B[i] 같은 순번 사용. '
+                      '끄면 CUT 기본=real_B 무작위/비짝)')
+            gr.Markdown(
+                'ℹ️ CUT는 **비짝(unpaired)** 학습이라 기본적으로 real_A(SAR)와 real_B(optical)는 '
+                '서로 다른 이미지를 참조하는 것이 정상입니다. SAR→optical 변환 결과는 **fake_B** 입니다. '
+                'SAR/optical 파일명이 1:1로 정렬된 짝 데이터라면 위 `serial_batches` 를 켜서 같은 순번끼리 묶을 수 있습니다.')
             save_cut = gr.Button('💾 CUT 파라미터 저장', variant='primary')
             save_cut_out = gr.Textbox(label='', interactive=False)
 
