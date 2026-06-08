@@ -1,5 +1,23 @@
 
 
+> ## 이 포크의 확장 기능 (Attention · 전처리 · Web-UI)
+>
+> 공식 CUT(PyTorch)에 다음 기능을 추가했습니다. (TF 포크 `nanseko/nanse_test_repo`
+> 의 PyTorch 포팅 코드를 재활용)
+>
+> - **Attention**: 생성자에 CBAM / Coordinate Attention 을 선택적으로 삽입
+>   (`--attention_type cbam|coord`, `--attention_encoder/resblocks/decoder`).
+>   attention 사용 시 PatchNCE `nce_layers` 가 자동 보정됩니다.
+>   선택적 구조/색 손실(`--lambda_grad`, `--lambda_color`)도 추가했습니다.
+>   기본값(`none`)에서는 동작이 원본과 완전히 동일합니다 → `docs/ATTENTION_PORT.md`
+> - **SAR 전처리 파이프라인**: speckle 필터/강도 변환/히스토그램 매핑 등
+>   순서 편집 가능한 NumPy/Pillow 파이프라인 → `preprocessing/`,
+>   `python scripts/preprocess_pipeline.py`, 설계는 `docs/README_pipeline.md`
+> - **Web-UI**: 전처리·학습·추론을 브라우저에서 수행하는 Gradio GUI →
+>   `python gui.py` (자세히는 `docs/GUI.md`)
+>
+> 검증: `python tests/test_attention_port.py`, `python tests/test_preprocessing.py`
+
 # Contrastive Unpaired Translation (CUT)
 
 ### [video (1m)](https://youtu.be/Llg0vE_MVgk) |  [video (10m)](https://youtu.be/jSGOzjmN8q0) | [website](http://taesung.me/ContrastiveUnpairedTranslation/) |   [paper](https://arxiv.org/pdf/2007.15651)

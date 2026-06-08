@@ -45,6 +45,17 @@ class BaseOptions():
                             help='no dropout for the generator')
         parser.add_argument('--no_antialias', action='store_true', help='if specified, use stride=2 convs instead of antialiased-downsampling (sad)')
         parser.add_argument('--no_antialias_up', action='store_true', help='if specified, use [upconv(learned filter)] instead of [upconv(hard-coded [1,3,3,1] filter), conv]')
+        # attention parameters (CBAM / Coordinate attention in the Resnet generator)
+        parser.add_argument('--attention_type', type=str, default='none', choices=['none', 'cbam', 'coord'],
+                            help='attention module inserted in the generator: none | cbam | coord')
+        parser.add_argument('--attention_reduction', type=int, default=16,
+                            help='channel bottleneck reduction ratio for attention modules')
+        parser.add_argument('--attention_encoder', action='store_true',
+                            help='insert attention after the stem and each downsampling stage of G')
+        parser.add_argument('--attention_resblocks', action='store_true',
+                            help='refine each ResnetBlock residual branch with attention')
+        parser.add_argument('--attention_decoder', action='store_true',
+                            help='insert attention after each upsampling stage of G')
         # dataset parameters
         parser.add_argument('--dataset_mode', type=str, default='unaligned', help='chooses how datasets are loaded. [unaligned | aligned | single | colorization]')
         parser.add_argument('--direction', type=str, default='AtoB', help='AtoB or BtoA')

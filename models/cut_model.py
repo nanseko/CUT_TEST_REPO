@@ -3,6 +3,7 @@ import torch
 from .base_model import BaseModel
 from . import networks
 from .patchnce import PatchNCELoss
+from .losses_extra import gradient_loss, color_moment_loss
 import util.util as util
 
 
@@ -35,6 +36,10 @@ class CUTModel(BaseModel):
         parser.add_argument('--flip_equivariance',
                             type=util.str2bool, nargs='?', const=True, default=False,
                             help="Enforce flip-equivariance as additional regularization. It's used by FastCUT, but not CUT")
+        parser.add_argument('--lambda_grad', type=float, default=0.0,
+                            help='weight for the structure/gradient preservation loss between real_A and fake_B (0 = off)')
+        parser.add_argument('--lambda_color', type=float, default=0.0,
+                            help='weight for the colour-moment consistency loss on the identity path idt_B vs real_B (0 = off, needs nce_idt)')
 
         parser.set_defaults(pool_size=0)  # no image pooling
 
@@ -66,6 +71,12 @@ class CUTModel(BaseModel):
             self.loss_names += ['NCE_Y']
             self.visual_names += ['idt_B']
 
+        # optional structure / colour regularisation losses (see models/losses_extra.py)
+        if self.isTrain and getattr(opt, 'lambda_grad', 0.0) > 0.0:
+            self.loss_names += ['G_grad']
+        if self.isTrain and getattr(opt, 'lambda_color', 0.0) > 0.0 and opt.nce_idt:
+            self.loss_names += ['G_color']
+
         if self.isTrain:
             self.model_names = ['G', 'F', 'D']
         else:  # during test time, only load G
@@ -74,6 +85,18 @@ class CUTModel(BaseModel):
         # define networks (both generator and discriminator)
         self.netG = networks.define_G(opt.input_nc, opt.output_nc, opt.ngf, opt.netG, opt.normG, not opt.no_dropout, opt.init_type, opt.init_gain, opt.no_antialias, opt.no_antialias_up, self.gpu_ids, opt)
         self.netF = networks.define_F(opt.input_nc, opt.netF, opt.normG, not opt.no_dropout, opt.init_type, opt.init_gain, opt.no_antialias, self.gpu_ids, opt)
+
+        # When attention modules are inserted, the generator's nn.Sequential
+        # indices shift, so the string --nce_layers (default 0,4,8,12,16) would
+        # tap the wrong layers. Use the architecture's attention-aware tap
+        # indices instead. (Identical to the default when attention is off.)
+        attention_on = getattr(opt, 'attention_type', 'none') != 'none' and (
+            opt.attention_encoder or opt.attention_resblocks or opt.attention_decoder)
+        if attention_on:
+            gen = self.netG.module if hasattr(self.netG, 'module') else self.netG
+            if hasattr(gen, 'nce_default'):
+                self.nce_layers = list(gen.nce_default)
+                print('[CUT] attention active -> nce_layers auto-set to %s' % self.nce_layers)
 
         if self.isTrain:
             self.netD = networks.define_D(opt.output_nc, opt.ndf, opt.netD, opt.n_layers_D, opt.normD, opt.init_type, opt.init_gain, opt.no_antialias, self.gpu_ids, opt)
@@ -193,6 +216,15 @@ class CUTModel(BaseModel):
             loss_NCE_both = self.loss_NCE
 
         self.loss_G = self.loss_G_GAN + loss_NCE_both
+
+        # optional structure / colour regularisation (ported from the TF CUT fork)
+        if getattr(self.opt, 'lambda_grad', 0.0) > 0.0:
+            self.loss_G_grad = gradient_loss(self.real_A, self.fake_B) * self.opt.lambda_grad
+            self.loss_G = self.loss_G + self.loss_G_grad
+        if getattr(self.opt, 'lambda_color', 0.0) > 0.0 and self.opt.nce_idt:
+            self.loss_G_color = color_moment_loss(self.idt_B, self.real_B) * self.opt.lambda_color
+            self.loss_G = self.loss_G + self.loss_G_color
+
         return self.loss_G
 
     def calculate_NCE_loss(self, src, tgt):

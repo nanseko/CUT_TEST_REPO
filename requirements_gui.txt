@@ -1,0 +1,9 @@
+# Web-UI (gui.py) dependencies for the PyTorch CUT pipeline.
+# Install the base requirements first:  pip install -r requirements.txt
+gradio>=4.0
+numpy
+pillow
+requests          # M4-SAR dataset download (Colab)
+# optional preprocessing extras:
+# bm3d            # BM3D speckle filter (else falls back to refined_lee)
+# opencv-python   # CLAHE in histogram mapping

@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# experiment / run artifacts
+/checkpoints/
+/results/
+gui_config.json
+preproc_config.json
+
+# datasets
+/datasets/*/

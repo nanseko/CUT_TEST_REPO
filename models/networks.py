@@ -6,6 +6,7 @@ import functools
 from torch.optim import lr_scheduler
 import numpy as np
 from .stylegan_networks import StyleGAN2Discriminator, StyleGAN2Generator, TileStyleGAN2Discriminator
+from .attention import make_attention
 
 ###############################################################################
 # Helper Functions
@@ -246,12 +247,21 @@ def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, in
     net = None
     norm_layer = get_norm_layer(norm_type=norm)
 
+    # optional CBAM / Coordinate attention, read from opt (defaults keep CUT unchanged)
+    attn_kwargs = dict(
+        attention_type=getattr(opt, 'attention_type', 'none'),
+        attention_reduction=getattr(opt, 'attention_reduction', 16),
+        attention_encoder=getattr(opt, 'attention_encoder', False),
+        attention_resblocks=getattr(opt, 'attention_resblocks', False),
+        attention_decoder=getattr(opt, 'attention_decoder', False),
+    )
+
     if netG == 'resnet_9blocks':
-        net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, no_antialias=no_antialias, no_antialias_up=no_antialias_up, n_blocks=9, opt=opt)
+        net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, no_antialias=no_antialias, no_antialias_up=no_antialias_up, n_blocks=9, opt=opt, **attn_kwargs)
     elif netG == 'resnet_6blocks':
-        net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, no_antialias=no_antialias, no_antialias_up=no_antialias_up, n_blocks=6, opt=opt)
+        net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, no_antialias=no_antialias, no_antialias_up=no_antialias_up, n_blocks=6, opt=opt, **attn_kwargs)
     elif netG == 'resnet_4blocks':
-        net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, no_antialias=no_antialias, no_antialias_up=no_antialias_up, n_blocks=4, opt=opt)
+        net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, no_antialias=no_antialias, no_antialias_up=no_antialias_up, n_blocks=4, opt=opt, **attn_kwargs)
     elif netG == 'unet_128':
         net = UnetGenerator(input_nc, output_nc, 7, ngf, norm_layer=norm_layer, use_dropout=use_dropout)
     elif netG == 'unet_256':
@@ -918,7 +928,9 @@ class ResnetGenerator(nn.Module):
     We adapt Torch code and idea from Justin Johnson's neural style transfer project(https://github.com/jcjohnson/fast-neural-style)
     """
 
-    def __init__(self, input_nc, output_nc, ngf=64, norm_layer=nn.BatchNorm2d, use_dropout=False, n_blocks=6, padding_type='reflect', no_antialias=False, no_antialias_up=False, opt=None):
+    def __init__(self, input_nc, output_nc, ngf=64, norm_layer=nn.BatchNorm2d, use_dropout=False, n_blocks=6, padding_type='reflect', no_antialias=False, no_antialias_up=False, opt=None,
+                 attention_type='none', attention_reduction=16,
+                 attention_encoder=False, attention_resblocks=False, attention_decoder=False):
         """Construct a Resnet-based generator
 
         Parameters:
@@ -929,8 +941,20 @@ class ResnetGenerator(nn.Module):
             use_dropout (bool)  -- if use dropout layers
             n_blocks (int)      -- the number of ResNet blocks
             padding_type (str)  -- the name of padding layer in conv layers: reflect | replicate | zero
+            attention_type (str)        -- 'none' | 'cbam' | 'coord' (CBAM / Coordinate attention)
+            attention_reduction (int)   -- channel bottleneck reduction for attention
+            attention_encoder (bool)    -- insert attention after the stem / each downsampling stage
+            attention_resblocks (bool)  -- refine each ResnetBlock residual with attention
+            attention_decoder (bool)    -- insert attention after each upsampling stage
+
+        Attention follows the TensorFlow CUT fork. With ``attention_type == 'none'``
+        (the default) the module layout is byte-identical to the original CUT
+        generator, so existing checkpoints load unchanged. When attention modules
+        are inserted the ``nn.Sequential`` indices shift, so the architecture
+        exposes the corrected PatchNCE tap indices via ``self.nce_default``.
         """
         assert(n_blocks >= 0)
+        assert attention_type in ('none', 'cbam', 'coord')
         super(ResnetGenerator, self).__init__()
         self.opt = opt
         if type(norm_layer) == functools.partial:
@@ -938,51 +962,78 @@ class ResnetGenerator(nn.Module):
         else:
             use_bias = norm_layer == nn.InstanceNorm2d
 
-        model = [nn.ReflectionPad2d(3),
-                 nn.Conv2d(input_nc, ngf, kernel_size=7, padding=0, bias=use_bias),
-                 norm_layer(ngf),
-                 nn.ReLU(True)]
+        use_attention = (attention_type != 'none')
+        model = []
+        taps = {}    # semantic tap -> module index (after any attention insertion)
+
+        def add(m):
+            model.append(m)
+            return len(model) - 1
+
+        def attn(ch):
+            return make_attention(attention_type, ch, attention_reduction)
+
+        # ---- stem (7x7); 'pixel' tap is the input reflection pad (official idx 0)
+        taps['pixel'] = add(nn.ReflectionPad2d(3))
+        add(nn.Conv2d(input_nc, ngf, kernel_size=7, padding=0, bias=use_bias))
+        add(norm_layer(ngf))
+        add(nn.ReLU(True))
+        if use_attention and attention_encoder:
+            add(attn(ngf))
 
         n_downsampling = 2
         for i in range(n_downsampling):  # add downsampling layers
             mult = 2 ** i
-            if(no_antialias):
-                model += [nn.Conv2d(ngf * mult, ngf * mult * 2, kernel_size=3, stride=2, padding=1, bias=use_bias),
-                          norm_layer(ngf * mult * 2),
-                          nn.ReLU(True)]
-            else:
-                model += [nn.Conv2d(ngf * mult, ngf * mult * 2, kernel_size=3, stride=1, padding=1, bias=use_bias),
-                          norm_layer(ngf * mult * 2),
-                          nn.ReLU(True),
-                          Downsample(ngf * mult * 2)]
+            # the downsampling conv is the encoder feature tap (official idx 4 / 8)
+            taps['enc%d' % i] = add(nn.Conv2d(ngf * mult, ngf * mult * 2, kernel_size=3,
+                                              stride=2 if no_antialias else 1,
+                                              padding=1, bias=use_bias))
+            add(norm_layer(ngf * mult * 2))
+            add(nn.ReLU(True))
+            if not no_antialias:
+                add(Downsample(ngf * mult * 2))
+            if use_attention and attention_encoder:
+                add(attn(ngf * mult * 2))
 
         mult = 2 ** n_downsampling
         for i in range(n_blocks):       # add ResNet blocks
-
-            model += [ResnetBlock(ngf * mult, padding_type=padding_type, norm_layer=norm_layer, use_dropout=use_dropout, use_bias=use_bias)]
+            idx = add(ResnetBlock(ngf * mult, padding_type=padding_type, norm_layer=norm_layer,
+                                  use_dropout=use_dropout, use_bias=use_bias,
+                                  attention_type=attention_type if attention_resblocks else 'none',
+                                  attention_reduction=attention_reduction))
+            if i == 0:
+                taps['res0'] = idx
+            if i == min(4, n_blocks - 1):
+                taps['res4'] = idx
 
         for i in range(n_downsampling):  # add upsampling layers
             mult = 2 ** (n_downsampling - i)
             if no_antialias_up:
-                model += [nn.ConvTranspose2d(ngf * mult, int(ngf * mult / 2),
-                                             kernel_size=3, stride=2,
-                                             padding=1, output_padding=1,
-                                             bias=use_bias),
-                          norm_layer(int(ngf * mult / 2)),
-                          nn.ReLU(True)]
+                add(nn.ConvTranspose2d(ngf * mult, int(ngf * mult / 2),
+                                       kernel_size=3, stride=2,
+                                       padding=1, output_padding=1,
+                                       bias=use_bias))
+                add(norm_layer(int(ngf * mult / 2)))
+                add(nn.ReLU(True))
             else:
-                model += [Upsample(ngf * mult),
-                          nn.Conv2d(ngf * mult, int(ngf * mult / 2),
-                                    kernel_size=3, stride=1,
-                                    padding=1,  # output_padding=1,
-                                    bias=use_bias),
-                          norm_layer(int(ngf * mult / 2)),
-                          nn.ReLU(True)]
-        model += [nn.ReflectionPad2d(3)]
-        model += [nn.Conv2d(ngf, output_nc, kernel_size=7, padding=0)]
-        model += [nn.Tanh()]
+                add(Upsample(ngf * mult))
+                add(nn.Conv2d(ngf * mult, int(ngf * mult / 2),
+                              kernel_size=3, stride=1,
+                              padding=1,  # output_padding=1,
+                              bias=use_bias))
+                add(norm_layer(int(ngf * mult / 2)))
+                add(nn.ReLU(True))
+            if use_attention and attention_decoder:
+                add(attn(int(ngf * mult / 2)))
+        add(nn.ReflectionPad2d(3))
+        add(nn.Conv2d(ngf, output_nc, kernel_size=7, padding=0))
+        add(nn.Tanh())
 
         self.model = nn.Sequential(*model)
+        # attention-aware default PatchNCE taps; equals the official
+        # [0, 4, 8, 12, 16] when attention is off and n_blocks == 9.
+        self.nce_default = [taps['pixel'], taps['enc0'], taps['enc1'],
+                            taps['res0'], taps['res4']]
 
     def forward(self, input, layers=[], encode_only=False):
         if -1 in layers:
@@ -1123,16 +1174,22 @@ class ResnetEncoder(nn.Module):
 class ResnetBlock(nn.Module):
     """Define a Resnet block"""
 
-    def __init__(self, dim, padding_type, norm_layer, use_dropout, use_bias):
+    def __init__(self, dim, padding_type, norm_layer, use_dropout, use_bias,
+                 attention_type='none', attention_reduction=16):
         """Initialize the Resnet block
 
         A resnet block is a conv block with skip connections
         We construct a conv block with build_conv_block function,
         and implement skip connections in <forward> function.
         Original Resnet paper: https://arxiv.org/pdf/1512.03385.pdf
+
+        When ``attention_type`` is not 'none', a CBAM / Coordinate attention
+        module refines the residual branch before it is added back (mirrors the
+        TensorFlow CUT fork). Defaults keep the original behaviour unchanged.
         """
         super(ResnetBlock, self).__init__()
         self.conv_block = self.build_conv_block(dim, padding_type, norm_layer, use_dropout, use_bias)
+        self.attention = make_attention(attention_type, dim, attention_reduction)
 
     def build_conv_block(self, dim, padding_type, norm_layer, use_dropout, use_bias):
         """Construct a convolutional block.
@@ -1176,7 +1233,7 @@ class ResnetBlock(nn.Module):
 
     def forward(self, x):
         """Forward function (with skip connections)"""
-        out = x + self.conv_block(x)  # add skip connections
+        out = x + self.attention(self.conv_block(x))  # add skip connections
         return out
 
 
