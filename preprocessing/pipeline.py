@@ -200,6 +200,9 @@ def run_pipeline(config, max_preview=12):
     ok, fail, skip = 0, 0, 0
     save_fmt = io.get('save_format', 'png')
     for i, path in enumerate(files):
+        # log BEFORE processing so a hang/very-slow file is visible (the last
+        # "▶ ... 처리 시작" line points at the offending file/step).
+        yield log(f'▶ {i+1}/{len(files)} 처리 시작: {os.path.basename(path)}'), previews[-max_preview:]
         t0 = time.time()
         ctx = {'input_path': path, 'optical_target': optical_target,
                'stats': {}, 'skip': False}
@@ -225,6 +228,8 @@ def run_pipeline(config, max_preview=12):
                 writer.writerow([path, '', 'skipped', ctx.get('skip_reason', ''),
                                  oh, ow, '', '', '|'.join(enabled_names),
                                  '', '', '', '', '', round(time.time() - t0, 3)])
+                yield log(f'건너뜀 {i+1}/{len(files)}: {os.path.basename(path)} '
+                          f'({ctx.get("skip_reason", "")})'), previews[-max_preview:]
                 continue
             arr = img if img.dtype == np.uint8 else (np.clip(img, 0, 1) * 255).astype(np.uint8)
             if arr.ndim == 2:
@@ -250,7 +255,7 @@ def run_pipeline(config, max_preview=12):
                              '', '', '', '', '|'.join(enabled_names), '', '', '', '', '',
                              round(time.time() - t0, 3)])
             # show the real error in the streamed log, not only in manifest.csv
-            yield log(f'실패: {os.path.basename(path)} -> {err}'), previews[-max_preview:]
+            yield log(f'실패 {i+1}/{len(files)}: {os.path.basename(path)} -> {err}'), previews[-max_preview:]
 
         # preview (before/after) for first N successful images; isolated so a
         # preview problem never marks an otherwise-good image as failed.
@@ -266,8 +271,9 @@ def run_pipeline(config, max_preview=12):
             except Exception:
                 pass
 
-        if (i + 1) % 5 == 0 or i == 0 or i == len(files) - 1:
-            yield log(f'처리 {i+1}/{len(files)}  현재: {os.path.basename(path)}  '
+        if not failed:
+            yield log(f'완료 {i+1}/{len(files)}: {os.path.basename(path)} '
+                      f'({round(time.time() - t0, 2)}s)  '
                       f'(성공 {ok} / 건너뜀 {skip} / 실패 {fail})'), previews[-max_preview:]
 
     mf.close()
