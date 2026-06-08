@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PatchNCE Loss 완전 정복 — 그림으로 이해하기</title>
+<style>
+  :root{
+    --bg:#0f1420; --panel:#161d2e; --panel2:#1d2740;
+    --ink:#e8edf7; --muted:#9fb0cc; --line:#2c3a5a;
+    --accent:#4f8cff; --green:#22c55e; --warn:#f59e0b; --pink:#ec4899; --orange:#f97316; --violet:#8b5cf6; --teal:#14b8a6;
+  }
+  *{box-sizing:border-box;}
+  html{scroll-behavior:smooth;}
+  body{margin:0;background:linear-gradient(180deg,#0c111c,#0f1420 40%);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans KR","Malgun Gothic",sans-serif;line-height:1.75;font-size:16px;}
+  header{padding:54px 24px 40px;text-align:center;border-bottom:1px solid var(--line);
+    background:radial-gradient(1200px 420px at 50% -40%, rgba(236,72,153,.22), transparent);}
+  header h1{font-size:2.05rem;margin:0 0 10px;letter-spacing:-.5px;}
+  header p{color:var(--muted);margin:6px auto;max-width:800px;}
+  .badge{display:inline-block;background:var(--pink);color:#250716;font-weight:700;padding:3px 12px;border-radius:999px;font-size:.78rem;margin-bottom:14px;}
+  .wrap{max-width:1040px;margin:0 auto;padding:0 24px 90px;}
+  nav{position:sticky;top:0;z-index:30;background:rgba(12,17,28,.93);backdrop-filter:blur(8px);border-bottom:1px solid var(--line);padding:9px 18px;display:flex;gap:5px;flex-wrap:wrap;justify-content:center;}
+  nav a{color:var(--muted);text-decoration:none;font-size:.82rem;padding:5px 10px;border-radius:8px;}
+  nav a:hover{color:#fff;background:var(--panel2);}
+  section{margin-top:54px;}
+  h2{font-size:1.5rem;border-left:4px solid var(--pink);padding-left:14px;margin:0 0 6px;}
+  h2 .num{color:var(--pink);font-weight:800;margin-right:8px;}
+  h3{font-size:1.15rem;margin:24px 0 8px;color:#ffd9ec;}
+  .lead{color:var(--muted);margin:0 0 16px;}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px 22px;margin:16px 0;}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:18px;}
+  @media(max-width:860px){.grid2{grid-template-columns:1fr;}}
+  code{background:#0d1426;border:1px solid var(--line);padding:1px 6px;border-radius:5px;font-size:.86em;color:#a7c4ff;font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace;}
+  pre{background:#0a0f1c;border:1px solid var(--line);border-radius:10px;padding:14px 16px;overflow:auto;font-size:.84rem;}
+  pre code{background:none;border:none;padding:0;color:#cbd6f0;}
+  table{width:100%;border-collapse:collapse;margin:12px 0;font-size:.92rem;}
+  th,td{border:1px solid var(--line);padding:9px 12px;text-align:left;vertical-align:top;}
+  th{background:var(--panel2);color:#ffd9ec;}
+  .note{border-left:4px solid var(--warn);background:rgba(245,158,11,.08);padding:12px 16px;border-radius:0 10px 10px 0;margin:14px 0;}
+  .key{border-left:4px solid var(--green);background:rgba(34,197,94,.08);padding:12px 16px;border-radius:0 10px 10px 0;margin:14px 0;}
+  .ana{border-left:4px solid var(--violet);background:rgba(139,92,246,.10);padding:12px 16px;border-radius:0 10px 10px 0;margin:14px 0;}
+  .stepbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0 4px;}
+  .chip{padding:5px 11px;border-radius:8px;font-size:.82rem;border:1px solid var(--line);background:#0d1426;}
+  .chip.on{background:rgba(236,72,153,.18);border-color:#9d2667;color:#ffd9ec;font-weight:700;}
+  .btn{cursor:pointer;border:none;border-radius:9px;padding:9px 16px;font-weight:700;font-size:.9rem;background:var(--accent);color:#06122c;}
+  .btn.alt{background:var(--panel2);color:var(--ink);border:1px solid var(--line);}
+  .legend span{margin-right:14px;font-size:.84rem;}
+  .dot{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:5px;vertical-align:middle;}
+  /* patch grids */
+  .pgrid{display:grid;grid-template-columns:repeat(8,1fr);gap:3px;max-width:260px;}
+  .pcell{aspect-ratio:1;border-radius:3px;background:#27314a;transition:all .35s;}
+  .pcell.sel{background:#ec4899;box-shadow:0 0 10px rgba(236,72,153,.8);}
+  .pcell.selB{background:#4f8cff;box-shadow:0 0 10px rgba(79,140,255,.8);}
+  /* similarity matrix */
+  .matwrap{display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start;}
+  .mat{display:grid;grid-template-columns:auto repeat(6,40px);gap:3px;align-items:center;}
+  .mcell{width:40px;height:40px;border-radius:5px;display:grid;place-items:center;font-size:.7rem;color:#06122c;font-weight:700;cursor:pointer;}
+  .mhead{font-size:.7rem;color:var(--muted);text-align:center;}
+  .mdiag{outline:2px solid #fff;outline-offset:-2px;}
+  .bars{display:flex;flex-direction:column;gap:4px;min-width:230px;}
+  .barrow{display:flex;align-items:center;gap:6px;font-size:.74rem;}
+  .bartrack{flex:1;height:14px;background:#0d1426;border-radius:6px;overflow:hidden;border:1px solid var(--line);}
+  .barfill{height:100%;background:linear-gradient(90deg,#4f8cff,#ec4899);}
+  .big{font-size:1.5rem;font-weight:800;}
+  canvas{max-width:100%;height:auto;background:#0a0f1c;border:1px solid var(--line);border-radius:10px;}
+  .slider{width:100%;}
+  footer{border-top:1px solid var(--line);margin-top:60px;padding:24px;text-align:center;color:var(--muted);font-size:.85rem;}
+  .fade{opacity:.25;transition:opacity .5s;}
+  .fade.show{opacity:1;}
+</style>
+</head>
+<body>
+<header>
+  <div class="badge">PatchNCE LOSS · 초보자용 완전 해설</div>
+  <h1>PatchNCE Loss, 그림으로 이해하기</h1>
+  <p>CUT의 핵심 손실인 <b>PatchNCE</b>가 정확히 <b>어떻게 계산되고</b>, <b>무엇을 의미하는지</b>를
+     애니메이션과 인터랙티브 요소로 한 단계씩 설명합니다. 슬라이더를 직접 움직여 보세요.</p>
+  <p style="font-size:.85rem;">근거 코드: <code>modules/losses.py · PatchNCELoss</code>, <code>modules/cut_model.py · PatchSampleMLP</code></p>
+</header>
+
+<nav>
+  <a href="#why">0. 왜?</a>
+  <a href="#analogy">1. 한 줄 비유</a>
+  <a href="#pipeline">2. 전체 흐름</a>
+  <a href="#sample">3. 패치 샘플링</a>
+  <a href="#embed">4. 임베딩</a>
+  <a href="#matrix">5. 유사도 행렬 ▶</a>
+  <a href="#infonce">6. InfoNCE</a>
+  <a href="#temp">7. temperature ▶</a>
+  <a href="#code">8. 코드 매핑</a>
+  <a href="#read">9. 값 읽기</a>
+</nav>
+
+<div class="wrap">
+
+<!-- 0 -->
+<section id="why">
+  <h2><span class="num">0</span>PatchNCE는 무슨 문제를 푸는가</h2>
+  <div class="card">
+    <p>CUT은 <b>짝이 없는(unpaired)</b> 변환입니다. SAR 입력에 대응하는 "정답 optical"이 없습니다.
+       그래서 "출력을 정답과 픽셀 비교"가 불가능합니다.</p>
+    <p>GAN loss만 쓰면 "optical처럼 보이긴 하는데 <b>입력과 전혀 다른 그림</b>"이 나올 수 있습니다(내용 붕괴).
+       이를 막으려면 <b>"출력이 입력의 구조·내용을 유지"</b>하도록 강제하는 장치가 필요합니다.</p>
+    <div class="key"><b>PatchNCE = 입력과 출력의 "같은 위치 조각(patch)"이 서로 닮도록 묶어주는 끈.</b>
+      정답 이미지 없이도, 입력 자신을 기준으로 내용 보존을 학습합니다.</div>
+  </div>
+</section>
+
+<!-- 1 -->
+<section id="analogy">
+  <h2><span class="num">1</span>한 줄 비유 — "짝 찾기 게임"</h2>
+  <div class="ana">
+    출력 이미지의 한 조각(<b>query</b>)을 들고, 입력 이미지의 여러 조각들 사이에서
+    <b>"내 원래 자리(같은 위치)"를 찾아내는 객관식 문제</b>를 푸는 것이 PatchNCE입니다.<br>
+    정답(같은 위치 = <b>positive</b>)은 가깝게, 오답(다른 위치 = <b>negative</b>)은 멀게 만들면,
+    출력의 각 부분이 입력의 대응 부분을 닮게 되어 <b>구조가 보존</b>됩니다.
+  </div>
+</section>
+
+<!-- 2 -->
+<section id="pipeline">
+  <h2><span class="num">2</span>전체 계산 흐름 (6단계)</h2>
+  <p class="lead">아래 "▶ 단계별 재생"을 누르면 한 단계씩 켜집니다.</p>
+  <div class="card">
+    <div class="stepbar" id="pipe-steps">
+      <span class="chip" data-s="0">① 특징 추출</span>
+      <span>→</span><span class="chip" data-s="1">② 같은 위치 패치 샘플</span>
+      <span>→</span><span class="chip" data-s="2">③ MLP 투영 + 정규화</span>
+      <span>→</span><span class="chip" data-s="3">④ 유사도 행렬</span>
+      <span>→</span><span class="chip" data-s="4">⑤ InfoNCE(softmax)</span>
+      <span>→</span><span class="chip" data-s="5">⑥ 여러 층 평균</span>
+    </div>
+    <div style="margin:10px 0;"><button class="btn" id="pipe-play">▶ 단계별 재생</button>
+      <button class="btn alt" id="pipe-reset">처음으로</button></div>
+    <div id="pipe-desc" class="card" style="margin:8px 0 0;background:var(--panel2);min-height:70px;">
+      재생 버튼을 눌러보세요.
+    </div>
+  </div>
+</section>
+
+<!-- 3 -->
+<section id="sample">
+  <h2><span class="num">3</span>Step ②: "같은 위치" 패치를 뽑는다</h2>
+  <p class="lead">입력(real_A)과 출력(fake_B)의 특징맵에서 <b>완전히 동일한 위치</b>의 패치들을 무작위로 N개 뽑습니다.
+     (코드의 <code>patch_ids</code>가 두 쪽에 동일하게 쓰여 "같은 자리"가 보장됩니다.)</p>
+  <div class="card">
+    <div style="display:flex;gap:30px;flex-wrap:wrap;align-items:center;justify-content:center;">
+      <div style="text-align:center;">
+        <div style="font-size:.85rem;color:var(--muted);margin-bottom:6px;">입력 real_A 특징맵</div>
+        <div class="pgrid" id="sg-A"></div>
+      </div>
+      <div style="font-size:1.5rem;color:var(--muted);">같은 위치 →</div>
+      <div style="text-align:center;">
+        <div style="font-size:.85rem;color:var(--muted);margin-bottom:6px;">출력 fake_B 특징맵</div>
+        <div class="pgrid" id="sg-B"></div>
+      </div>
+    </div>
+    <div style="text-align:center;margin-top:14px;"><button class="btn" id="sg-btn">🎲 다시 무작위 샘플</button></div>
+    <div class="legend" style="text-align:center;margin-top:8px;">
+      <span><span class="dot" style="background:#ec4899"></span>입력에서 뽑힌 위치</span>
+      <span><span class="dot" style="background:#4f8cff"></span>출력에서 같은 위치</span>
+    </div>
+    <div class="note">한 번에 모든 픽셀을 비교하면 너무 무겁기 때문에, 매 스텝 <b>무작위로 N개 위치만</b> 골라 비교합니다(코드 기본 256개). 그래서 이름이 "Patch"NCE입니다.</div>
+  </div>
+</section>
+
+<!-- 4 -->
+<section id="embed">
+  <h2><span class="num">4</span>Step ③: 패치를 "임베딩(벡터)"으로 — 그리고 학습의 의미</h2>
+  <p class="lead">각 패치를 작은 2-layer MLP(<code>netF</code>)에 통과시키고 <b>L2 정규화</b>합니다. 그러면 모든 패치가
+     "단위 구(반지름 1) 위의 점"이 됩니다. 점들 사이 각도(코사인 유사도)가 곧 닮은 정도입니다.</p>
+  <div class="card">
+    <canvas id="embcanvas" width="760" height="300"></canvas>
+    <div class="legend" style="margin-top:8px;">
+      <span><span class="dot" style="background:#ec4899"></span>입력 패치 임베딩 (고정)</span>
+      <span><span class="dot" style="background:#4f8cff"></span>출력 패치 임베딩 (학습으로 이동)</span>
+      <span><span class="dot" style="background:#22c55e"></span>positive 쌍 연결선</span>
+    </div>
+    <div class="key">애니메이션: 학습이 진행될수록 <b>출력 패치(파랑)가 자신의 짝(positive, 분홍)에게 끌려가</b> 가까워집니다.
+      = "같은 위치끼리 닮아진다". 이게 PatchNCE가 실제로 하는 일입니다.</div>
+  </div>
+</section>
+
+<!-- 5 -->
+<section id="matrix">
+  <h2><span class="num">5</span>Step ④: 유사도 행렬 만들기 (인터랙티브)</h2>
+  <p class="lead">출력 패치 N개 × 입력 패치 N개의 <b>모든 쌍의 유사도</b>를 한 표에 담습니다.
+     행 = 출력 패치(query), 열 = 입력 패치. <b>대각선(같은 위치)이 positive</b>, 나머지는 negative입니다.</p>
+  <div class="card">
+    <p style="margin:0 0 10px;">아래 행렬은 6개 패치 예시입니다. 각 행을 클릭하면 그 query의 분포를 오른쪽에 보여줍니다.
+       <b>temperature 슬라이더</b>를 움직여 값이 어떻게 날카로워지는지 보세요.</p>
+    <div style="margin:10px 0;">
+      temperature τ = <b id="tau-val">0.07</b>
+      <input type="range" min="2" max="100" value="7" class="slider" id="tau" style="max-width:360px;">
+      <span style="font-size:.8rem;color:var(--muted)">(작을수록 날카로움)</span>
+    </div>
+    <div class="matwrap">
+      <div>
+        <div style="font-size:.78rem;color:var(--muted);margin-bottom:4px;text-align:center;">행 softmax 확률 (밝을수록 큼)</div>
+        <div class="mat" id="simmat"></div>
+        <div style="font-size:.74rem;color:var(--muted);margin-top:6px;text-align:center;">대각선(흰 테두리)=positive · 클릭으로 행 선택</div>
+      </div>
+      <div>
+        <div style="font-size:.82rem;color:var(--muted);margin-bottom:6px;">선택한 query 행의 softmax 확률</div>
+        <div class="bars" id="rowbars"></div>
+        <div class="card" style="margin-top:12px;background:var(--panel2);text-align:center;">
+          이 행의 손실 −log(p<sub>정답</sub>) = <span class="big" id="rowloss" style="color:#ec4899">·</span><br>
+          <span style="font-size:.8rem;color:var(--muted)">전체 PatchNCE(이 층) = 모든 행 손실의 평균 = <b id="totloss">·</b></span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 6 -->
+<section id="infonce">
+  <h2><span class="num">6</span>Step ⑤: InfoNCE = "객관식 정답 맞히기"</h2>
+  <p class="lead">유사도 행렬의 각 행에 <b>softmax</b>를 씌워 확률로 바꾸고, "정답(대각선)을 골랐는가"를 <b>교차엔트로피</b>로 채점합니다.</p>
+  <div class="grid2">
+    <div class="card">
+      <h3 style="margin-top:0;">수식 (한 query 기준)</h3>
+      <pre><code>logit_j = (query · 입력패치_j) / τ
+p_j = softmax(logit)_j           # 후보들에 대한 확률
+loss = −log( p_정답 )            # 정답=같은 위치(대각선)</code></pre>
+      <p style="font-size:.9rem;">정답 확률 <code>p_정답</code>이 1에 가까우면 loss→0, 0에 가까우면 loss→∞.
+         즉 "정답을 확신할수록" 손실이 작아집니다.</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0;">왜 "정규화 + temperature"인가</h3>
+      <ul style="margin:6px 0;font-size:.92rem;">
+        <li><b>L2 정규화</b>: 벡터 크기를 1로 맞춰 <b>방향(각도)만</b> 비교 → 코사인 유사도가 됨.</li>
+        <li><b>τ(temperature)</b>: 유사도 차이를 확대/축소. 작을수록 정답·오답을 더 <b>극단적으로</b> 구분(어려운 오답도 확실히 밀어냄).</li>
+        <li><b>negative</b>: 같은 이미지 내 <b>다른 위치</b> 패치들. "내 자리"를 다른 자리와 구별하게 함.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="ana"><b>객관식 비유:</b> query는 학생, 후보 패치들은 보기. 정답은 "같은 위치" 한 개.
+    softmax는 학생이 매긴 보기별 확신도, cross-entropy는 "정답에 얼마나 확신했나"로 매기는 점수입니다.</div>
+</section>
+
+<!-- 7 -->
+<section id="temp">
+  <h2><span class="num">7</span>temperature가 loss에 주는 영향 (직접 실험)</h2>
+  <p class="lead">위 5절의 슬라이더와 연동됩니다. 같은 유사도라도 τ에 따라 loss가 크게 달라집니다.</p>
+  <div class="card">
+    <table>
+      <tr><th>τ 값</th><th>분포 모양</th><th>정답 확률</th><th>loss 경향</th></tr>
+      <tr><td>작음 (0.02~0.07)</td><td>매우 날카로움 (정답에 집중)</td><td>높음 → 1에 근접</td><td>작아짐(정답이 최고 유사도일 때)</td></tr>
+      <tr><td>기본 (0.07)</td><td>적당히 날카로움</td><td>—</td><td>CUT 기본값</td></tr>
+      <tr><td>큼 (0.5~1.0)</td><td>평평함 (다 비슷하게)</td><td>낮음 → 1/N 근처</td><td>커짐(ln N 근처)</td></tr>
+    </table>
+    <div class="note">주의: τ를 줄인다고 "실제로 더 잘 배운" 게 아닙니다. τ는 <b>난이도 조절 다이얼</b>입니다. 정답이 진짜로 가장 닮았을 때만 작은 τ가 loss를 낮춰줍니다. 정답이 안 닮았는데 τ만 줄이면 loss가 오히려 폭증합니다.</div>
+  </div>
+</section>
+
+<!-- 8 -->
+<section id="code">
+  <h2><span class="num">8</span>실제 코드와 1:1 매핑 (losses.py)</h2>
+  <div class="card">
+    <pre><code>def __call__(self, source, target, netE, netF):
+    feat_source = netE(source)              # ① 입력(real_A) 다층 특징
+    feat_target = netE(target)              # ① 출력(fake_B) 다층 특징
+
+    # ② 같은 위치 패치 샘플 + ③ MLP 투영 + L2 정규화
+    feat_source_pool, sample_ids = netF(feat_source, patch_ids=None)
+    feat_target_pool, _          = netF(feat_target, patch_ids=sample_ids)  # 같은 위치!
+
+    total = 0.0
+    for feat_s, feat_t in zip(feat_source_pool, feat_target_pool):   # ⑥ 층마다
+        n, dim = feat_s.shape
+        logit = (feat_t @ feat_sᵀ) / temp        # ④ 유사도 행렬 (n×n)
+        target = eye(n)                          #   대각선=정답(positive)
+        loss = cross_entropy(target, logit)      # ⑤ InfoNCE
+        total += mean(loss)
+    return total / num_layers                    # ⑥ 층 평균</code></pre>
+    <table>
+      <tr><th>코드</th><th>의미</th></tr>
+      <tr><td><code>netE(source/target)</code></td><td>Generator와 가중치 공유하는 인코더로 다층 특징 추출</td></tr>
+      <tr><td><code>netF(..., patch_ids)</code></td><td>같은 위치 패치 N개를 뽑아 MLP 임베딩 + L2 정규화</td></tr>
+      <tr><td><code>feat_t @ feat_sᵀ / temp</code></td><td>모든 출력·입력 패치쌍 코사인 유사도를 τ로 나눔</td></tr>
+      <tr><td><code>eye(n)</code> (대각선)</td><td>"같은 위치"가 정답이라는 라벨</td></tr>
+      <tr><td><code>cross_entropy</code></td><td>각 행이 자기 대각선을 고르도록 학습</td></tr>
+      <tr><td><code>/ num_layers</code></td><td>여러 층(저수준~고수준) 손실의 평균</td></tr>
+    </table>
+  </div>
+  <div class="key"><b>"여러 층"의 의미:</b> 인코더 앞쪽 층은 에지·질감 같은 저수준, 뒤쪽 층은 더 의미적인 구조를 담습니다.
+    여러 층에서 동시에 PatchNCE를 걸어 <b>세밀한 디테일부터 큰 구조까지</b> 모두 보존합니다.</div>
+</section>
+
+<!-- 9 -->
+<section id="read">
+  <h2><span class="num">9</span>PatchNCE 값을 읽는 법 & 자주 묻는 것</h2>
+  <div class="card">
+    <table>
+      <tr><th>상황</th><th>의미</th></tr>
+      <tr><td>NCE_loss가 꾸준히 ↓</td><td>✅ 출력이 입력 구조를 점점 잘 따라감 (정상)</td></tr>
+      <tr><td>NCE_loss가 안 떨어짐/정체</td><td>내용 보존 실패 위험 — 구조가 무너질 수 있음</td></tr>
+      <tr><td>NCE가 0에 가깝게 급락</td><td>대개 출력이 입력을 거의 복사(변환이 약함)하는 신호일 수 있음</td></tr>
+    </table>
+    <h3>자주 묻는 것</h3>
+    <p><b>Q. positive/negative에 정답 optical이 쓰이나요?</b><br>
+       아니요. <b>입력(real_A)과 그 출력(fake_B)</b>만 씁니다. 정답 optical은 등장하지 않습니다 — 그래서 unpaired에서도 동작합니다.</p>
+    <p><b>Q. "PatchLoss"가 따로 있나요?</b><br>
+       이 구현에서 패치 기반 손실은 <b>PatchNCELoss 하나</b>입니다(아이덴티티 경로용으로 한 번 더 계산될 뿐). "PatchNCE = PatchNCE Loss"로 보면 됩니다.</p>
+    <p><b>Q. GAN loss와 무슨 차이?</b><br>
+       GAN = "optical처럼 보이는가(스타일)", PatchNCE = "입력 내용을 유지하는가(콘텐츠)". 둘은 <b>역할이 다르고 함께</b> 작동합니다.</p>
+  </div>
+  <div class="key">한 줄 요약: <b>PatchNCE = 입력·출력의 같은 위치 패치를 임베딩해, "정답(같은 위치)을 골라내는 객관식"을 풀게 만드는 대조 손실</b>.
+    정답이 가까워질수록 loss가 작아지고, 결과적으로 <b>구조가 보존</b>됩니다.</div>
+</section>
+
+</div>
+
+<footer>PatchNCE Loss 해설 · 근거: <code>modules/losses.py</code>, <code>modules/cut_model.py</code></footer>
+
+<script>
+/* ---------- 2. pipeline step player ---------- */
+const pipeDesc = [
+ "① 특징 추출 — 입력 real_A와 출력 fake_B를 같은 인코더(netE)에 통과시켜 여러 층의 특징맵을 얻습니다.",
+ "② 같은 위치 패치 샘플 — 두 특징맵에서 '완전히 동일한 위치' N개를 무작위로 뽑습니다 (patch_ids 공유).",
+ "③ MLP 투영 + L2 정규화 — 각 패치를 작은 MLP(netF)로 벡터화하고 길이를 1로 맞춰 단위 구 위 점으로 만듭니다.",
+ "④ 유사도 행렬 — 출력 패치 × 입력 패치 모든 쌍의 코사인 유사도를 τ로 나눠 N×N 행렬을 만듭니다.",
+ "⑤ InfoNCE(softmax) — 각 행에 softmax를 씌우고, 대각선(같은 위치=정답)을 고르도록 cross-entropy로 학습합니다.",
+ "⑥ 여러 층 평균 — 모든 층에서 구한 손실을 평균내어 최종 PatchNCE loss가 됩니다."
+];
+let pStep=-1;
+const chips=[...document.querySelectorAll('#pipe-steps .chip')];
+function showStep(s){
+  chips.forEach((c,i)=>c.classList.toggle('on', i<=s));
+  document.getElementById('pipe-desc').textContent = s>=0? pipeDesc[s] : "재생 버튼을 눌러보세요.";
+}
+document.getElementById('pipe-play').onclick=()=>{
+  pStep=-1; const t=setInterval(()=>{ pStep++; showStep(pStep); if(pStep>=5) clearInterval(t); }, 900);
+};
+document.getElementById('pipe-reset').onclick=()=>{ pStep=-1; showStep(-1); };
+
+/* ---------- 3. patch sampling animation ---------- */
+const gA=document.getElementById('sg-A'), gB=document.getElementById('sg-B');
+const N=64;
+for(let i=0;i<N;i++){ const a=document.createElement('div');a.className='pcell';gA.appendChild(a);
+                      const b=document.createElement('div');b.className='pcell';gB.appendChild(b); }
+function sampleGrids(){
+  const cells=[...gA.children], cellsB=[...gB.children];
+  cells.forEach(c=>c.className='pcell'); cellsB.forEach(c=>c.className='pcell');
+  const idx=new Set(); while(idx.size<8) idx.add(Math.floor(Math.random()*N));
+  [...idx].forEach((k,n)=>{ setTimeout(()=>{ cells[k].className='pcell sel'; cellsB[k].className='pcell selB'; }, n*90); });
+}
+document.getElementById('sg-btn').onclick=sampleGrids; sampleGrids();
+
+/* ---------- 4. embedding circle animation ---------- */
+(function(){
+  const cv=document.getElementById('embcanvas'); if(!cv)return; const ctx=cv.getContext('2d');
+  const W=cv.width,H=cv.height, cx1=W*0.30, cx2=W*0.30, cy=H/2, R=110; // single circle, two sets
+  const K=5;
+  // input embeddings (fixed angles), output start angles (offset), converge over loop
+  const inAng=[], outStart=[];
+  for(let i=0;i<K;i++){ inAng.push(-Math.PI/2 + i*(2*Math.PI/K)); outStart.push(inAng[i]+ (Math.random()*1.6-0.8) + 1.2); }
+  let prog=0, dir=1;
+  function pt(cx,ang){ return [cx+R*Math.cos(ang), cy+R*Math.sin(ang)]; }
+  function frame(){
+    prog+=0.006*dir; if(prog>1){prog=1;dir=-1;} if(prog<0){prog=0;dir=1;}
+    ctx.clearRect(0,0,W,H);
+    // circle
+    ctx.strokeStyle='#2c3a5a'; ctx.lineWidth=1.5; ctx.beginPath(); ctx.arc(W*0.42,cy,R,0,7); ctx.stroke();
+    ctx.fillStyle='#9fb0cc'; ctx.font='13px sans-serif';
+    ctx.fillText('단위 구 (반지름 1) 위의 패치 임베딩', W*0.42-120, 26);
+    const cx=W*0.42;
+    for(let i=0;i<K;i++){
+      const [ix,iy]=pt(cx,inAng[i]);
+      const oa = outStart[i] + (inAng[i]-outStart[i])*prog;   // converge toward positive
+      const [ox,oy]=pt(cx,oa);
+      // connection (positive pair)
+      ctx.strokeStyle='rgba(34,197,94,'+(0.3+0.5*prog)+')'; ctx.lineWidth=2;
+      ctx.beginPath(); ctx.moveTo(ix,iy); ctx.lineTo(ox,oy); ctx.stroke();
+      // input dot
+      ctx.fillStyle='#ec4899'; ctx.beginPath(); ctx.arc(ix,iy,7,0,7); ctx.fill();
+      // output dot
+      ctx.fillStyle='#4f8cff'; ctx.beginPath(); ctx.arc(ox,oy,7,0,7); ctx.fill();
+    }
+    ctx.fillStyle='#cbd6f0'; ctx.font='12px sans-serif';
+    ctx.fillText('학습 진행도: '+Math.round(prog*100)+'%  (출력 → positive 로 끌려감)', W*0.42-120, H-14);
+    requestAnimationFrame(frame);
+  }
+  frame();
+})();
+
+/* ---------- 5/7. interactive similarity matrix + temperature ---------- */
+const S=[
+ [0.86,0.12,0.30,-0.04,0.20,0.10],
+ [0.15,0.80,0.10,0.25,0.05,0.18],
+ [0.28,0.08,0.88,0.12,0.22,0.02],
+ [-0.02,0.22,0.14,0.78,0.10,0.30],
+ [0.18,0.06,0.20,0.08,0.83,0.12],
+ [0.09,0.20,0.04,0.27,0.14,0.81]
+];
+const M=S.length; let selRow=0, tau=0.07;
+const simmat=document.getElementById('simmat');
+function softmaxRow(row, t){
+  const z=row.map(v=>v/t); const mx=Math.max(...z);
+  const ex=z.map(v=>Math.exp(v-mx)); const s=ex.reduce((a,b)=>a+b,0);
+  return ex.map(v=>v/s);
+}
+function heat(p){ // probability -> color (dark->pink)
+  const r=Math.round(40+215*p), g=Math.round(45+15*p), b=Math.round(74+80*p);
+  return `rgb(${r},${g},${b})`;
+}
+function renderMatrix(){
+  simmat.innerHTML='';
+  simmat.appendChild(cellHead(''));
+  for(let j=0;j<M;j++) simmat.appendChild(cellHead('입'+(j+1)));
+  let probs=[];
+  for(let i=0;i<M;i++) probs.push(softmaxRow(S[i],tau));
+  for(let i=0;i<M;i++){
+    simmat.appendChild(cellHead('출'+(i+1)));
+    for(let j=0;j<M;j++){
+      const c=document.createElement('div'); c.className='mcell'+(i===j?' mdiag':'');
+      c.style.background=heat(probs[i][j]);
+      c.textContent=probs[i][j].toFixed(2);
+      if(i===selRow) c.style.boxShadow='0 0 0 2px #ec4899';
+      c.onclick=()=>{ selRow=i; renderMatrix(); renderBars(); };
+      simmat.appendChild(c);
+    }
+  }
+  // total loss = mean of -log(p_ii)
+  let tot=0; for(let i=0;i<M;i++) tot += -Math.log(probs[i][i]+1e-9);
+  document.getElementById('totloss').textContent=(tot/M).toFixed(3);
+}
+function cellHead(t){ const d=document.createElement('div'); d.className='mhead'; d.textContent=t; return d; }
+function renderBars(){
+  const p=softmaxRow(S[selRow],tau);
+  const box=document.getElementById('rowbars'); box.innerHTML='';
+  p.forEach((v,j)=>{
+    const row=document.createElement('div'); row.className='barrow';
+    const lab=document.createElement('span'); lab.style.width='52px';
+    lab.textContent='입'+(j+1)+(j===selRow?' ★':''); lab.style.color=(j===selRow)?'#22c55e':'#9fb0cc';
+    const tr=document.createElement('div'); tr.className='bartrack';
+    const fl=document.createElement('div'); fl.className='barfill'; fl.style.width=(v*100)+'%';
+    const val=document.createElement('span'); val.style.width='42px'; val.textContent=v.toFixed(2);
+    tr.appendChild(fl); row.appendChild(lab); row.appendChild(tr); row.appendChild(val); box.appendChild(row);
+  });
+  const loss=-Math.log(p[selRow]+1e-9);
+  document.getElementById('rowloss').textContent=loss.toFixed(3);
+}
+document.getElementById('tau').addEventListener('input',e=>{
+  tau=Math.max(0.02, e.target.value/100);
+  document.getElementById('tau-val').textContent=tau.toFixed(2);
+  renderMatrix(); renderBars();
+});
+renderMatrix(); renderBars();
+</script>
+</body>
+</html>

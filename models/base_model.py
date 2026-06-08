@@ -218,6 +218,13 @@ class BaseModel(ABC):
                 if hasattr(state_dict, '_metadata'):
                     del state_dict._metadata
 
+                # Strip a leading 'module.' (checkpoints saved while the network
+                # was wrapped in nn.DataParallel, e.g. CPU training) so they load
+                # into the plain network used at load time.
+                if any(k.startswith('module.') for k in state_dict.keys()):
+                    state_dict = {k[len('module.'):] if k.startswith('module.') else k: v
+                                  for k, v in state_dict.items()}
+
                 # patch InstanceNorm checkpoints prior to 0.4
                 # for key in list(state_dict.keys()):  # need to copy keys here because we mutate in loop
                 #    self.__patch_instance_norm_state_dict(state_dict, net, key.split('.'))

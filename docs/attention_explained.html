@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CUT 생성기에 Attention을 추가한 이유와 위치 — 초보자용 완전 해설</title>
+<style>
+  :root{
+    --bg:#0f1420; --panel:#161d2e; --panel2:#1d2740;
+    --ink:#e8edf7; --muted:#9fb0cc; --line:#2c3a5a;
+    --accent:#4f8cff; --green:#22c55e; --warn:#f59e0b; --pink:#ec4899; --orange:#f97316; --violet:#8b5cf6; --teal:#14b8a6; --blue:#3b82f6;
+  }
+  *{box-sizing:border-box;}
+  html{scroll-behavior:smooth;}
+  body{margin:0;background:linear-gradient(180deg,#0c111c,#0f1420 40%);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans KR","Malgun Gothic",sans-serif;line-height:1.75;font-size:16px;}
+  header{padding:54px 24px 42px;text-align:center;border-bottom:1px solid var(--line);
+    background:radial-gradient(1200px 440px at 50% -40%, rgba(249,115,22,.22), transparent);}
+  header h1{font-size:2.05rem;margin:0 0 10px;letter-spacing:-.5px;}
+  header p{color:var(--muted);margin:6px auto;max-width:820px;}
+  .badge{display:inline-block;background:var(--orange);color:#1a1206;font-weight:700;padding:3px 12px;border-radius:999px;font-size:.78rem;margin-bottom:14px;}
+  .wrap{max-width:1060px;margin:0 auto;padding:0 24px 90px;}
+  nav{position:sticky;top:0;z-index:30;background:rgba(12,17,28,.93);backdrop-filter:blur(8px);border-bottom:1px solid var(--line);padding:9px 16px;display:flex;gap:5px;flex-wrap:wrap;justify-content:center;}
+  nav a{color:var(--muted);text-decoration:none;font-size:.8rem;padding:5px 9px;border-radius:8px;}
+  nav a:hover{color:#fff;background:var(--panel2);}
+  section{margin-top:56px;}
+  h2{font-size:1.5rem;border-left:4px solid var(--orange);padding-left:14px;margin:0 0 6px;}
+  h2 .num{color:var(--orange);font-weight:800;margin-right:8px;}
+  h3{font-size:1.15rem;margin:24px 0 8px;color:#ffe0c2;}
+  .lead{color:var(--muted);margin:0 0 16px;}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px 22px;margin:16px 0;}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:18px;}
+  .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;}
+  @media(max-width:860px){.grid2,.grid3{grid-template-columns:1fr;}}
+  code{background:#0d1426;border:1px solid var(--line);padding:1px 6px;border-radius:5px;font-size:.86em;color:#a7c4ff;font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace;}
+  pre{background:#0a0f1c;border:1px solid var(--line);border-radius:10px;padding:14px 16px;overflow:auto;font-size:.83rem;}
+  pre code{background:none;border:none;padding:0;color:#cbd6f0;}
+  table{width:100%;border-collapse:collapse;margin:12px 0;font-size:.92rem;}
+  th,td{border:1px solid var(--line);padding:9px 12px;text-align:left;vertical-align:top;}
+  th{background:var(--panel2);color:#ffe0c2;}
+  .note{border-left:4px solid var(--warn);background:rgba(245,158,11,.08);padding:12px 16px;border-radius:0 10px 10px 0;margin:14px 0;}
+  .key{border-left:4px solid var(--green);background:rgba(34,197,94,.08);padding:12px 16px;border-radius:0 10px 10px 0;margin:14px 0;}
+  .ana{border-left:4px solid var(--violet);background:rgba(139,92,246,.10);padding:12px 16px;border-radius:0 10px 10px 0;margin:14px 0;}
+  .btn{cursor:pointer;border:none;border-radius:9px;padding:9px 16px;font-weight:700;font-size:.9rem;background:var(--accent);color:#06122c;}
+  .btn.alt{background:var(--panel2);color:var(--ink);border:1px solid var(--line);}
+  .btn.org{background:var(--orange);color:#1a1206;}
+  .legend span{margin-right:14px;font-size:.84rem;}
+  .dot{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:5px;vertical-align:middle;}
+  .pill{display:inline-block;padding:2px 9px;border-radius:6px;font-size:.74rem;font-weight:700;border:1px solid;}
+  .pEnc{color:#bcd3ff;border-color:#3b6fd4;background:rgba(59,130,246,.16);}
+  .pRes{color:#d6c8ff;border-color:#7c3aed;background:rgba(139,92,246,.16);}
+  .pDec{color:#9af0e4;border-color:#0d9488;background:rgba(20,184,166,.16);}
+  .pAtt{color:#fdba74;border-color:#b45309;background:rgba(249,115,22,.18);}
+  /* feature grids */
+  .fgrid{display:grid;gap:3px;}
+  .fcell{border-radius:3px;transition:all .4s;}
+  /* pipeline */
+  #pipe{display:flex;flex-wrap:wrap;gap:6px;align-items:stretch;justify-content:center;margin:10px 0;}
+  .pblock{position:relative;min-width:96px;border-radius:10px;border:1.5px solid;padding:10px 8px 22px;text-align:center;font-size:.82rem;background:var(--panel2);}
+  .pblock small{display:block;color:var(--muted);font-size:.68rem;}
+  .b-io{border-color:#64748b;background:#1b2336;}
+  .b-enc{border-color:var(--blue);background:rgba(59,130,246,.12);}
+  .b-res{border-color:var(--violet);background:rgba(139,92,246,.12);}
+  .b-dec{border-color:var(--teal);background:rgba(20,184,166,.12);}
+  .att-badge{position:absolute;top:-10px;right:-8px;background:var(--orange);color:#1a1206;font-size:.62rem;font-weight:800;padding:1px 6px;border-radius:6px;animation:pop .3s ease;}
+  @keyframes pop{from{transform:scale(0);}to{transform:scale(1);}}
+  .tap{position:absolute;bottom:-26px;left:50%;transform:translateX(-50%);white-space:nowrap;font-size:.62rem;color:#f9a8d4;border:1px solid #9d2667;background:rgba(236,72,153,.12);border-radius:6px;padding:1px 6px;}
+  .arrowx{align-self:center;color:#4a5a7e;font-size:1.1rem;}
+  .toggle{display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin:6px 0 28px;}
+  .toggle label{display:flex;align-items:center;gap:6px;font-size:.9rem;background:#0d1426;border:1px solid var(--line);border-radius:8px;padding:6px 12px;cursor:pointer;}
+  canvas{max-width:100%;height:auto;background:#0a0f1c;border:1px solid var(--line);border-radius:10px;}
+  .bars{display:flex;flex-direction:column;gap:5px;}
+  .barrow{display:flex;align-items:center;gap:8px;font-size:.76rem;}
+  .bartrack{flex:1;height:16px;background:#0d1426;border-radius:6px;overflow:hidden;border:1px solid var(--line);}
+  .barfill{height:100%;transition:width .6s;}
+  .stepbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
+  .chip{padding:5px 11px;border-radius:8px;font-size:.82rem;border:1px solid var(--line);background:#0d1426;}
+  .chip.on{background:rgba(249,115,22,.2);border-color:#b45309;color:#ffe0c2;font-weight:700;}
+  footer{border-top:1px solid var(--line);margin-top:60px;padding:24px;text-align:center;color:var(--muted);font-size:.85rem;}
+</style>
+</head>
+<body>
+<header>
+  <div class="badge">CUT + ATTENTION · 초보자용 완전 해설</div>
+  <h1>CUT 생성기에 Attention을 추가한 이유와 위치</h1>
+  <p>Attention이 <b>무엇인지</b>부터, CUT의 어디에 <b>왜</b> 넣었는지까지 —
+     움직이는 그림과 직접 켜보는 도표로 초보자도 이해할 수 있게 설명합니다.
+     아래 파이프라인의 체크박스를 직접 켜보세요.</p>
+  <p style="font-size:.85rem;">근거 코드: <code>modules/attention.py</code> · <code>modules/cut_model.py</code> · <code>modules/layers.py</code></p>
+</header>
+
+<nav>
+  <a href="#intro">0. CUT 구조</a>
+  <a href="#what">1. Attention이란?</a>
+  <a href="#why">2. 왜 필요?</a>
+  <a href="#cbam">3. CBAM ▶</a>
+  <a href="#coord">4. Coordinate ▶</a>
+  <a href="#where">5. 어디에? ▶</a>
+  <a href="#whyhere">6. 왜 그 위치?</a>
+  <a href="#resblock">7. ResBlock</a>
+  <a href="#params">8. 파라미터</a>
+  <a href="#summary">9. 요약</a>
+</nav>
+
+<div class="wrap">
+
+<!-- 0 -->
+<section id="intro">
+  <h2><span class="num">0</span>먼저: CUT 생성기는 어떻게 생겼나</h2>
+  <p class="lead">Attention을 "어디"에 넣는지 이해하려면, 생성기(Generator)의 3단 구조를 먼저 알아야 합니다.</p>
+  <div class="grid3">
+    <div class="card" style="border-color:var(--blue);"><span class="pill pEnc">① Encoder</span>
+      <p style="margin:8px 0 0;font-size:.9rem;">입력 SAR을 점점 작은 "특징(feature)"으로 압축. 7×7 Conv → 2번 다운샘플 (256채널, 64×64).</p></div>
+    <div class="card" style="border-color:var(--violet);"><span class="pill pRes">② ResBlock ×9</span>
+      <p style="margin:8px 0 0;font-size:.9rem;">압축된 특징 공간에서 <b>도메인 변환</b>(SAR→Optical)의 핵심 변형이 일어나는 9개 블록.</p></div>
+    <div class="card" style="border-color:var(--teal);"><span class="pill pDec">③ Decoder</span>
+      <p style="margin:8px 0 0;font-size:.9rem;">특징을 다시 이미지로 복원. 2번 업샘플 → 7×7 Conv(tanh).</p></div>
+  </div>
+  <div class="ana"><b>비유:</b> Encoder=재료를 잘게 다지기, ResBlock=요리(맛 변환), Decoder=접시에 담기.
+    Attention은 이 과정 곳곳에서 "중요한 재료/부분에 더 집중하라"고 지시하는 양념입니다.</div>
+</section>
+
+<!-- 1 -->
+<section id="what">
+  <h2><span class="num">1</span>Attention이란? — "중요한 곳을 비추는 스포트라이트"</h2>
+  <p class="lead">Attention은 특징맵의 각 위치/채널에 <b>0~1 가중치</b>를 곱해 <b>중요한 곳은 키우고 덜 중요한 곳은 줄이는</b> 장치입니다.</p>
+  <div class="card">
+    <div style="display:flex;gap:26px;flex-wrap:wrap;align-items:center;justify-content:center;">
+      <div style="text-align:center;">
+        <div style="font-size:.82rem;color:var(--muted);margin-bottom:6px;">원본 특징 (잡음 섞임)</div>
+        <div class="fgrid" id="att-raw" style="grid-template-columns:repeat(8,26px);"></div>
+      </div>
+      <div style="font-size:1.4rem;color:var(--orange);">× 가중치 =</div>
+      <div style="text-align:center;">
+        <div style="font-size:.82rem;color:var(--muted);margin-bottom:6px;">Attention 적용 후</div>
+        <div class="fgrid" id="att-out" style="grid-template-columns:repeat(8,26px);"></div>
+      </div>
+    </div>
+    <div style="text-align:center;margin-top:14px;">
+      <button class="btn org" id="att-toggle">Attention 켜기 / 끄기</button>
+      <span id="att-state" style="margin-left:10px;color:var(--muted);font-size:.85rem;">현재: OFF</span>
+    </div>
+    <div class="key" style="margin-top:14px;">왼쪽엔 의미 없는 잡음(speckle)이 섞여 있습니다. Attention을 켜면 <b>중요한 영역(밝은 곳)은 유지·강조</b>되고
+      <b>잡음(어두운 잡티)은 억제</b>됩니다. 이게 Attention의 본질 — "선택적 집중"입니다.</div>
+  </div>
+</section>
+
+<!-- 2 -->
+<section id="why">
+  <h2><span class="num">2</span>왜 CUT에 Attention을 추가하나 (SAR→Optical의 어려움)</h2>
+  <p class="lead">대상 작업은 SAR(레이더) 영상을 Optical(광학) 영상으로 바꾸는 것. 이 작업만의 어려움이 곧 Attention 도입의 이유입니다.</p>
+  <div class="grid2">
+    <div class="card"><h3 style="margin-top:0;">🛰️ ① speckle 잡음</h3>
+      <p style="font-size:.92rem;">SAR엔 알갱이 같은 잡음이 강합니다. 일반 Conv는 잡음·신호를 구분 못해 잡음을 그대로 "광학 질감"으로 잘못 번역합니다. Attention이 잡음을 억제합니다.</p></div>
+    <div class="card"><h3 style="margin-top:0;">🧭 ② 구조·방향성</h3>
+      <p style="font-size:.92rem;">도로, 건물 경계, 해안선, 농경지처럼 <b>위치·방향</b>이 중요한 구조가 많습니다. 방향성을 잡는 <b>Coordinate Attention</b>이 잘 맞습니다.</p></div>
+    <div class="card"><h3 style="margin-top:0;">🎯 ③ 채널·영역 선택</h3>
+      <p style="font-size:.92rem;">어떤 특징 채널/영역이 변환에 중요한지 일반 Conv는 모두 동등 취급. <b>CBAM</b>이 중요 채널·영역을 명시적으로 강조합니다.</p></div>
+    <div class="card"><h3 style="margin-top:0;">🔗 ④ PatchNCE 신호 강화</h3>
+      <p style="font-size:.92rem;">Attention으로 다듬은 특징을 PatchNCE가 읽으면 대조 학습 신호가 또렷해져 <b>구조 보존</b>이 강해집니다. <b>손실 함수는 그대로</b>!</p></div>
+  </div>
+  <div class="key">정리: Attention은 ①잡음 억제 ②구조/방향 보존 ③중요 채널·영역 강조 ④PatchNCE 신호 정제를 통해,
+    <b>기존 CUT 구조·손실을 거의 그대로 둔 채</b> SAR→Optical 품질을 끌어올리려는 시도입니다.</div>
+</section>
+
+<!-- 3 -->
+<section id="cbam">
+  <h2><span class="num">3</span>Attention 종류 ① CBAM — 채널 + 공간 (애니메이션)</h2>
+  <p class="lead">CBAM은 "<b>어떤 채널이 중요한가</b>"를 먼저, 그다음 "<b>어떤 위치가 중요한가</b>"를 순서대로 강조합니다.
+     아래 ▶ 재생을 눌러 단계를 보세요.</p>
+  <div class="card">
+    <div class="stepbar" id="cbam-steps">
+      <span class="chip" data-s="0">① 채널별 중요도 (GAP/GMP→MLP)</span><span>→</span>
+      <span class="chip" data-s="1">② 채널 가중치 곱</span><span>→</span>
+      <span class="chip" data-s="2">③ 공간 중요도 (7×7 Conv)</span><span>→</span>
+      <span class="chip" data-s="3">④ 공간 가중치 곱</span>
+    </div>
+    <div style="margin:12px 0;"><button class="btn org" id="cbam-play">▶ 재생</button></div>
+    <div class="grid2">
+      <div>
+        <div style="font-size:.82rem;color:var(--muted);margin-bottom:6px;">채널 Attention (채널별 0~1 가중치)</div>
+        <div class="bars" id="cbam-bars"></div>
+      </div>
+      <div>
+        <div style="font-size:.82rem;color:var(--muted);margin-bottom:6px;">공간 Attention (위치별 0~1 가중치)</div>
+        <div class="fgrid" id="cbam-spatial" style="grid-template-columns:repeat(8,24px);"></div>
+      </div>
+    </div>
+    <div id="cbam-desc" class="card" style="margin-top:12px;background:var(--panel2);min-height:54px;">재생 버튼을 눌러보세요.</div>
+  </div>
+  <div class="note">코드: <code>CBAM</code> = <code>ChannelAttention</code>(GAP+GMP→공유 MLP→sigmoid) 적용 후 <code>SpatialAttention</code>(채널평균/최댓값→7×7 Conv→sigmoid) 적용. 입력과 같은 shape을 반환해 그대로 끼워넣습니다.</div>
+</section>
+
+<!-- 4 -->
+<section id="coord">
+  <h2><span class="num">4</span>Attention 종류 ② Coordinate Attention — 방향성 (애니메이션)</h2>
+  <p class="lead">가로(W)·세로(H) 방향을 <b>따로 요약</b>해서, "어느 행/열이 중요한지"를 잡습니다. 도로·해안선 같은 <b>방향 구조</b> 보존에 강합니다.</p>
+  <div class="card">
+    <canvas id="coord-cv" width="760" height="320"></canvas>
+    <div style="text-align:center;margin-top:10px;"><button class="btn org" id="coord-play">▶ 방향 풀링 애니메이션</button></div>
+    <div class="legend" style="margin-top:8px;text-align:center;">
+      <span><span class="dot" style="background:#f97316"></span>세로(H) 방향 중요도</span>
+      <span><span class="dot" style="background:#4f8cff"></span>가로(W) 방향 중요도</span>
+    </div>
+    <div class="key" style="margin-top:12px;">Coordinate Attention은 H방향 pooling과 W방향 pooling을 각각 구해 <b>행·열의 중요도</b>를 만들고,
+      이를 곱해 "특정 방향의 구조"를 강조합니다. SAR→Optical 1순위 추천 이유입니다.</div>
+  </div>
+  <div class="note">코드: <code>CoordinateAttention</code> = H/W 방향 평균 pooling → concat → 1×1 bottleneck Conv → 다시 H/W로 분리 → 각각 1×1 Conv + sigmoid → <code>입력 × attn_h × attn_w</code>.</div>
+</section>
+
+<!-- 5 -->
+<section id="where">
+  <h2><span class="num">5</span>★ 어디에 넣었나 — 직접 켜보는 파이프라인</h2>
+  <p class="lead">아래 체크박스로 <b>Encoder / ResBlocks / Decoder</b> attention을 켜보세요. 주황 배지가 삽입 위치, 분홍 꼬리표가 <b>PatchNCE가 읽는 지점</b>입니다.</p>
+  <div class="card">
+    <div class="toggle">
+      <label><input type="checkbox" id="ck-enc"> <span class="pill pEnc">attention_encoder</span></label>
+      <label><input type="checkbox" id="ck-res"> <span class="pill pRes">attention_resblocks</span></label>
+      <label><input type="checkbox" id="ck-dec"> <span class="pill pDec">attention_decoder</span></label>
+      <button class="btn alt" id="ck-allon">모두 ON</button>
+      <button class="btn alt" id="ck-alloff">모두 OFF</button>
+    </div>
+    <div id="pipe"></div>
+    <div class="legend" style="margin-top:30px;text-align:center;">
+      <span><span class="dot" style="background:#f97316"></span>Attention 삽입</span>
+      <span><span class="dot" style="background:#ec4899"></span>PatchNCE tap (특징 읽는 곳)</span>
+    </div>
+    <div id="pipe-note" class="card" style="margin-top:14px;background:var(--panel2);"></div>
+  </div>
+  <table>
+    <tr><th>플래그</th><th>삽입 위치</th></tr>
+    <tr><td><span class="pill pAtt">attention_encoder</span></td><td>7×7 Conv 뒤 · 1st 다운샘플 뒤 · 2nd 다운샘플 뒤 (총 3곳)</td></tr>
+    <tr><td><span class="pill pAtt">attention_resblocks</span></td><td>각 ResBlock의 residual 가지 (conv 2개 통과 후, skip 더하기 전)</td></tr>
+    <tr><td><span class="pill pAtt">attention_decoder</span></td><td>각 업샘플 블록 뒤</td></tr>
+  </table>
+</section>
+
+<!-- 6 -->
+<section id="whyhere">
+  <h2><span class="num">6</span>★ 왜 "그 위치"인가 — 가장 중요한 핵심</h2>
+  <p class="lead">단순히 넣은 게 아니라, 각 위치에는 분명한 이유가 있습니다. 핵심은 <b>PatchNCE와의 연결</b>입니다.</p>
+
+  <div class="card" style="border-color:var(--pink);">
+    <h3 style="margin-top:0;">🔑 핵심: PatchNCE는 "생성기 중간 특징"을 그대로 읽는다</h3>
+    <p>CUT의 PatchNCE는 생성기의 <b>인코더~ResBlock 초반 출력</b>(<code>nce_layers</code>)을 대조 학습에 사용합니다.
+       따라서 그 지점에 Attention을 넣으면:</p>
+    <ul>
+      <li>PatchNCE가 <b>Attention으로 정제된 특징</b>을 자동으로 읽음 → 정답/오답 패치 구분이 또렷해짐</li>
+      <li><b>손실 함수(losses.py)는 한 줄도 안 고침</b> — 특징 품질만 올려 학습 신호를 강화</li>
+      <li>구조 보존(도로·경계·해안선)이 대조 학습 단계부터 강해짐</li>
+    </ul>
+    <canvas id="why-cv" width="900" height="240"></canvas>
+    <div class="legend" style="margin-top:8px;">
+      <span><span class="dot" style="background:#f97316"></span>Attention 정제</span>
+      <span><span class="dot" style="background:#ec4899"></span>PatchNCE로 흐르는 정제 특징</span>
+    </div>
+  </div>
+
+  <div class="grid3">
+    <div class="card" style="border-color:var(--blue);"><h3 style="margin-top:0;color:#9bc0ff;">① Encoder 위치</h3>
+      <p style="font-size:.9rem;"><b>왜?</b> SAR 잡음이 가장 먼저 들어오는 입구. 여기서 중요한 구조를 강조하고 잡음을 억제하면 <b>이후 모든 단계 + PatchNCE 패치</b>가 깨끗한 특징을 받습니다.</p></div>
+    <div class="card" style="border-color:var(--violet);"><h3 style="margin-top:0;color:#c7b3ff;">② ResBlock 위치</h3>
+      <p style="font-size:.9rem;"><b>왜?</b> 도메인 변환의 핵심이 일어나는 곳. residual 가지에만 적용해 <b>원본 경로는 보존</b>하며 변환 성분만 강조 → 안정적. PatchNCE도 이 영역을 읽어 신호가 직접 강화됨.</p></div>
+    <div class="card" style="border-color:var(--teal);"><h3 style="margin-top:0;color:#8ff0e2;">③ Decoder 위치 (선택)</h3>
+      <p style="font-size:.9rem;"><b>왜 선택?</b> 출력 외형(색·질감)에 <b>직접</b> 작용. 효과는 크지만 잘못 쓰면 artifact 위험 → encoder+resblocks 검증 후 추가 권장.</p></div>
+  </div>
+  <div class="key"><b>위치 선택 원칙:</b> ① 잡음이 들어오는 <b>인코더</b>, ② 변환이 일어나며 동시에 <b>PatchNCE가 읽는 ResBlock</b>에 우선 배치.
+    "특징 품질↑ → 대조 학습 신호↑ → 구조 보존↑"의 인과 사슬을 노린 것. 디코더는 출력에 직접 작용하므로 검증 후 선택적으로만.</div>
+</section>
+
+<!-- 7 -->
+<section id="resblock">
+  <h2><span class="num">7</span>ResBlock 안에서는 정확히 어디? (residual vs post_add)</h2>
+  <p class="lead">ResBlock은 "원본을 그대로 더하는 길(skip)"과 "변형하는 길(residual)"로 나뉩니다. Attention을 어느 쪽에 거느냐가 중요합니다.</p>
+  <div class="grid2">
+    <div class="card" style="border-color:var(--green);">
+      <h3 style="margin-top:0;">✅ residual (기본값)</h3>
+      <pre><code>x = conv2(conv1(input))   # 변형 경로
+x = attention(x)          # 변형분에만 적용
+return input + x          # 원본 보존 후 더함</code></pre>
+      <p style="font-size:.9rem;">원본(input)은 그대로 두고 <b>변형 성분에만</b> Attention. 학습이 안정적이라 기본값으로 채택.</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0;">post_add (선택)</h3>
+      <pre><code>x = input + conv2(conv1(input))
+return attention(x)       # 합쳐진 전체에 적용</code></pre>
+      <p style="font-size:.9rem;">skip까지 더한 <b>전체 출력</b>에 Attention. 더 공격적이지만 원본 경로도 눌릴 수 있어 주의.</p>
+    </div>
+  </div>
+  <div class="note">코드: <code>ResBlock(attention_position='residual')</code> 가 기본. <code>'post_add'</code> 로 바꾸면 전체 출력에 적용됩니다.</div>
+</section>
+
+<!-- 8 -->
+<section id="params">
+  <h2><span class="num">8</span>관련 파라미터 (한눈에)</h2>
+  <table>
+    <tr><th>파라미터</th><th>기본값</th><th>의미</th></tr>
+    <tr><td><code>--attention_type</code></td><td><code>none</code></td><td><code>none</code>(끔) / <code>cbam</code> / <code>coord</code></td></tr>
+    <tr><td><code>--attention_reduction</code></td><td><code>16</code></td><td>bottleneck 축소비. 작을수록 강하고 무거움(8↔32)</td></tr>
+    <tr><td><code>--attention_encoder</code></td><td>off</td><td>인코더 ConvBlock 뒤 적용</td></tr>
+    <tr><td><code>--attention_resblocks</code></td><td>off</td><td>ResBlock residual 가지에 적용</td></tr>
+    <tr><td><code>--attention_decoder</code></td><td>off</td><td>디코더 업샘플 뒤 적용</td></tr>
+  </table>
+  <div class="ana"><b>첫 실험 추천:</b> <code>attention_type=coord</code> + <code>encoder</code> + <code>resblocks</code> + <code>reduction=16</code>.
+    효과 확인 후 <code>cbam</code> 비교, 마지막에 <code>decoder</code> 추가.</div>
+</section>
+
+<!-- 9 -->
+<section id="summary">
+  <h2><span class="num">9</span>한 장 요약</h2>
+  <div class="card">
+    <ul>
+      <li><b>Attention</b> = 특징에 0~1 가중치를 곱해 <b>중요한 곳 강조, 잡음 억제</b>하는 스포트라이트.</li>
+      <li><b>CBAM</b> = 채널+공간 강조 / <b>Coordinate</b> = 가로·세로 방향 강조(SAR 구조에 적합).</li>
+      <li><b>어디에:</b> 인코더(3곳) · ResBlock residual · 디코더(선택). 플래그로 개별 On/Off.</li>
+      <li><b>왜 그 위치:</b> 잡음이 들어오는 인코더 + 변환이 일어나고 <b>PatchNCE가 읽는</b> ResBlock에 두면, 손실 함수 수정 없이 대조 학습 신호까지 강해짐.</li>
+      <li><b>기존 CUT 골격·손실은 유지</b> — Attention은 사이에 끼워넣기만 함.</li>
+    </ul>
+  </div>
+</section>
+
+</div>
+<footer>CUT + Attention 해설 · 근거: <code>modules/attention.py</code>, <code>modules/cut_model.py</code>, <code>modules/layers.py</code></footer>
+
+<script>
+/* ---------- 1. attention intuition grid ---------- */
+(function(){
+  const raw=document.getElementById('att-raw'), out=document.getElementById('att-out');
+  const N=64; const base=[], noise=[], imp=[];
+  for(let i=0;i<N;i++){
+    const r=(i/8|0), c=i%8;
+    // a "structure": diagonal band important
+    const structure = Math.exp(-Math.pow((r-c),2)/6);
+    imp.push(structure);
+    base.push(structure*0.8+0.1);
+    noise.push(Math.random()*0.6);          // speckle
+  }
+  let on=false;
+  function shade(v){ const g=Math.round(40+200*Math.max(0,Math.min(1,v))); return `rgb(${g-20},${g},${Math.round(g*0.7)})`; }
+  function render(){
+    raw.innerHTML=''; out.innerHTML='';
+    for(let i=0;i<N;i++){
+      const rv = Math.min(1, base[i]*0.6 + noise[i]);     // raw = signal + noise
+      const a = raw.appendChild(document.createElement('div')); a.className='fcell';
+      a.style.width=a.style.height='26px'; a.style.background=shade(rv);
+      const w = on ? imp[i] : 1;                            // attention weight
+      const ov = on ? Math.min(1, base[i]*w*1.1) : rv;      // suppress noise where unimportant
+      const b = out.appendChild(document.createElement('div')); b.className='fcell';
+      b.style.width=b.style.height='26px'; b.style.background=shade(ov);
+      b.style.transform = on ? `scale(${0.85+0.3*imp[i]})` : 'scale(1)';
+    }
+  }
+  document.getElementById('att-toggle').onclick=()=>{ on=!on;
+    document.getElementById('att-state').textContent='현재: '+(on?'ON (중요 영역 강조·잡음 억제)':'OFF'); render(); };
+  render();
+})();
+
+/* ---------- 3. CBAM step animation ---------- */
+(function(){
+  const bars=document.getElementById('cbam-bars'), sp=document.getElementById('cbam-spatial');
+  const C=8; const chImp=[]; for(let i=0;i<C;i++) chImp.push(0.15+Math.random()*0.85);
+  // build bars
+  const fills=[];
+  for(let i=0;i<C;i++){
+    const row=bars.appendChild(document.createElement('div')); row.className='barrow';
+    const lab=document.createElement('span'); lab.style.width='44px'; lab.textContent='ch'+(i+1); lab.style.color='#9fb0cc';
+    const tr=document.createElement('div'); tr.className='bartrack';
+    const fl=document.createElement('div'); fl.className='barfill'; fl.style.background='linear-gradient(90deg,#f97316,#fdba74)'; fl.style.width='0%';
+    tr.appendChild(fl); row.appendChild(lab); row.appendChild(tr); bars.appendChild(row); fills.push(fl);
+  }
+  // spatial grid
+  const SN=64, scells=[]; const simp=[];
+  for(let i=0;i<SN;i++){ const r=(i/8|0),c=i%8; simp.push(Math.exp(-(Math.pow(r-3.5,2)+Math.pow(c-4.5,2))/8)); }
+  for(let i=0;i<SN;i++){ const d=sp.appendChild(document.createElement('div')); d.className='fcell'; d.style.width=d.style.height='24px'; d.style.background='#27314a'; scells.push(d); }
+  const chips=[...document.querySelectorAll('#cbam-steps .chip')];
+  const desc=["① GAP/GMP로 각 채널의 대표값을 뽑아 MLP+sigmoid로 채널별 중요도(0~1)를 만듭니다.",
+              "② 그 가중치를 채널마다 곱해 '중요한 채널'을 키웁니다.",
+              "③ 채널을 가로질러 평균/최댓값을 구하고 7×7 Conv+sigmoid로 위치별 중요도를 만듭니다.",
+              "④ 위치 가중치를 곱해 '중요한 영역'을 키웁니다. (채널→공간 순서)"];
+  function setStep(s){
+    chips.forEach((c,i)=>c.classList.toggle('on',i<=s));
+    document.getElementById('cbam-desc').textContent=desc[s]||'재생 버튼을 눌러보세요.';
+    fills.forEach((f,i)=> f.style.width = (s>=1? chImp[i]*100 : (s>=0? 6:0))+'%');
+    scells.forEach((d,i)=>{ if(s>=3){ const g=Math.round(40+200*simp[i]); d.style.background=`rgb(${g},${Math.round(g*0.6)},${Math.round(g*0.5)})`; }
+      else if(s>=2){ d.style.background='#3a2a1c'; } else d.style.background='#27314a'; });
+  }
+  document.getElementById('cbam-play').onclick=()=>{ let s=-1; const t=setInterval(()=>{ s++; setStep(s); if(s>=3)clearInterval(t); },800); };
+  setStep(-1);
+})();
+
+/* ---------- 4. Coordinate attention canvas ---------- */
+(function(){
+  const cv=document.getElementById('coord-cv'); if(!cv)return; const ctx=cv.getContext('2d');
+  const W=cv.width,H=cv.height; const gx=250, gy=70, cell=26, n=8;
+  const himp=[],wimp=[];
+  for(let i=0;i<n;i++){ himp.push(0.2+0.8*Math.exp(-Math.pow(i-2,2)/4)); wimp.push(0.2+0.8*Math.exp(-Math.pow(i-5,2)/5)); }
+  let prog=0, playing=false;
+  function draw(){
+    ctx.clearRect(0,0,W,H);
+    // grid
+    for(let r=0;r<n;r++)for(let c=0;c<n;c++){
+      const v=Math.min(1,himp[r]*wimp[c]); const g=Math.round(40+150*v);
+      ctx.fillStyle = prog>0.6 ? `rgb(${g},${Math.round(g*0.6)},${Math.round(g*0.5)})` : '#27314a';
+      ctx.fillRect(gx+c*cell, gy+r*cell, cell-2, cell-2);
+    }
+    ctx.fillStyle='#9fb0cc'; ctx.font='12px sans-serif';
+    ctx.fillText('특징맵 (8×8)', gx, gy-12);
+    // H pooling strip (left), appears with prog
+    if(prog>0.15){
+      ctx.fillText('H 방향 중요도', gx-150, gy-12);
+      for(let r=0;r<n;r++){ const a=Math.min(1,prog*1.5)*himp[r]; const g=Math.round(60+180*a);
+        ctx.fillStyle=`rgba(249,115,22,${Math.min(1,prog*1.5)})`; ctx.fillRect(gx-60, gy+r*cell, 40*himp[r], cell-2); }
+    }
+    // W pooling strip (top)
+    if(prog>0.35){
+      ctx.fillStyle='#9fb0cc'; ctx.fillText('W 방향 중요도', gx+ n*cell+16, gy+10);
+      for(let c=0;c<n;c++){ ctx.fillStyle=`rgba(79,140,255,${Math.min(1,(prog-0.2)*1.6)})`;
+        ctx.fillRect(gx+c*cell, gy+n*cell+10, cell-2, 40*wimp[c]); }
+    }
+    if(prog>0.6){ ctx.fillStyle='#cbd6f0'; ctx.font='13px sans-serif';
+      ctx.fillText('→ H중요도 × W중요도 로 방향 구조 강조', gx-60, gy+n*cell+80); }
+    if(playing){ prog+=0.012; if(prog>=1){prog=1;playing=false;} requestAnimationFrame(draw); }
+  }
+  document.getElementById('coord-play').onclick=()=>{ prog=0; playing=true; draw(); };
+  draw();
+})();
+
+/* ---------- 5. interactive generator pipeline ---------- */
+(function(){
+  const pipe=document.getElementById('pipe');
+  // block defs: type, name, sub, attEnc(can host encoder att), attDec, isRes, tap(base name)
+  const blocks=[
+    {t:'io', n:'입력 SAR', s:'real_A', tap:'gen_input'},
+    {t:'enc',n:'7×7 Conv', s:'64ch', attEnc:1},
+    {t:'enc',n:'Down', s:'128ch', attEnc:1, tap:'enc_conv1'},
+    {t:'enc',n:'Down', s:'256ch', attEnc:1, tap:'enc_conv2'},
+    {t:'res',n:'ResBlock×9', s:'256ch', isRes:1, tapRes:1},
+    {t:'dec',n:'Up', s:'128ch', attDec:1},
+    {t:'dec',n:'Up', s:'64ch', attDec:1},
+    {t:'io', n:'출력 Optical', s:'tanh'},
+  ];
+  const cls={io:'b-io',enc:'b-enc',res:'b-res',dec:'b-dec'};
+  function render(){
+    const enc=document.getElementById('ck-enc').checked;
+    const res=document.getElementById('ck-res').checked;
+    const dec=document.getElementById('ck-dec').checked;
+    pipe.innerHTML='';
+    blocks.forEach((b,i)=>{
+      if(i>0){ const ar=document.createElement('div'); ar.className='arrowx'; ar.textContent='▶'; pipe.appendChild(ar); }
+      const d=document.createElement('div'); d.className='pblock '+cls[b.t];
+      d.innerHTML=`${b.n}<small>${b.s}</small>`;
+      // attention badge
+      if((b.attEnc&&enc)||(b.attDec&&dec)||(b.isRes&&res)){
+        const bd=document.createElement('div'); bd.className='att-badge';
+        bd.textContent = b.isRes? 'ATT(residual)' : 'ATT'; d.appendChild(bd);
+      }
+      // NCE tap marker
+      let tapLabel=null;
+      if(b.tap==='gen_input') tapLabel='NCE: 입력픽셀';
+      else if(b.tap==='enc_conv1') tapLabel = enc? 'NCE: 정제특징1' : 'NCE: enc_conv1';
+      else if(b.tap==='enc_conv2') tapLabel = enc? 'NCE: 정제특징2' : 'NCE: enc_conv2';
+      else if(b.tapRes) tapLabel = res? 'NCE: resblock(att포함)' : 'NCE: resblock_0/4';
+      if(tapLabel){ const tp=document.createElement('div'); tp.className='tap'; tp.textContent=tapLabel; d.appendChild(tp); }
+      pipe.appendChild(d);
+    });
+    // note
+    const note=document.getElementById('pipe-note');
+    const parts=[];
+    if(enc) parts.push('인코더 3곳에 Attention → PatchNCE가 <b>정제된 특징</b>을 읽습니다.');
+    if(res) parts.push('ResBlock residual에 Attention → 변환 핵심부 강조 + PatchNCE 신호 강화.');
+    if(dec) parts.push('디코더에 Attention → 출력 색·질감에 직접 작용(검증 후 권장).');
+    if(!enc&&!res&&!dec) parts.push('모두 OFF → 기존 CUT와 동일하게 동작합니다 (attention_type=none).');
+    note.innerHTML = parts.join('<br>');
+  }
+  ['ck-enc','ck-res','ck-dec'].forEach(id=>document.getElementById(id).addEventListener('change',render));
+  document.getElementById('ck-allon').onclick=()=>{['ck-enc','ck-res','ck-dec'].forEach(id=>document.getElementById(id).checked=true); render();};
+  document.getElementById('ck-alloff').onclick=()=>{['ck-enc','ck-res','ck-dec'].forEach(id=>document.getElementById(id).checked=false); render();};
+  render();
+})();
+
+/* ---------- 6. why-here flow animation ---------- */
+(function(){
+  const cv=document.getElementById('why-cv'); if(!cv)return; const ctx=cv.getContext('2d');
+  const W=cv.width,H=cv.height;
+  const enc={x:150,y:120}, res={x:430,y:120}, nce={x:760,y:120};
+  let parts=[]; // moving particles from enc/res to nce
+  function spawn(from){ parts.push({x:from.x,y:from.y,p:0,from}); }
+  let tick=0;
+  function frame(){
+    ctx.clearRect(0,0,W,H);
+    // nodes
+    function node(o,color,label,sub){
+      ctx.fillStyle=color; ctx.strokeStyle='#0a0f1c'; ctx.lineWidth=2;
+      ctx.beginPath(); ctx.roundRect(o.x-70,o.y-34,140,68,12); ctx.fill();
+      ctx.fillStyle='#06122c'; ctx.font='bold 14px sans-serif'; ctx.textAlign='center';
+      ctx.fillText(label,o.x,o.y-4); ctx.font='11px sans-serif'; ctx.fillText(sub,o.x,o.y+14);
+    }
+    // attention pulses on enc/res
+    const pulse=0.5+0.5*Math.sin(tick/12);
+    ctx.fillStyle=`rgba(249,115,22,${0.25+0.35*pulse})`;
+    ctx.beginPath(); ctx.arc(enc.x,enc.y,46+6*pulse,0,7); ctx.fill();
+    ctx.beginPath(); ctx.arc(res.x,res.y,46+6*pulse,0,7); ctx.fill();
+    node(enc,'#fdba74','Encoder','Attention 정제');
+    node(res,'#c7b3ff','ResBlock','Attention 정제');
+    node(nce,'#f9a8d4','PatchNCE','대조 학습');
+    // spawn particles
+    if(tick%18===0){ spawn(enc); spawn(res); }
+    ctx.strokeStyle='rgba(236,72,153,.25)'; ctx.beginPath(); ctx.moveTo(enc.x+70,enc.y); ctx.lineTo(nce.x-70,nce.y); ctx.moveTo(res.x+70,res.y); ctx.lineTo(nce.x-70,nce.y); ctx.stroke();
+    parts.forEach(p=>{ p.p+=0.02; const tx=nce.x-70, ty=nce.y;
+      p.x = p.from.x+70 + (tx-(p.from.x+70))*p.p; p.y = p.from.y + (ty-p.from.y)*p.p;
+      ctx.fillStyle='#ec4899'; ctx.beginPath(); ctx.arc(p.x,p.y,5,0,7); ctx.fill(); });
+    parts=parts.filter(p=>p.p<1);
+    ctx.fillStyle='#9fb0cc'; ctx.font='12px sans-serif'; ctx.textAlign='center';
+    ctx.fillText('Attention이 정제한 특징이 그대로 PatchNCE로 흘러가 학습 신호를 강화 (손실 함수 수정 없음)', W/2, H-16);
+    tick++; requestAnimationFrame(frame);
+  }
+  if(!ctx.roundRect){ ctx.roundRect=function(x,y,w,h,r){this.beginPath();this.moveTo(x+r,y);this.arcTo(x+w,y,x+w,y+h,r);this.arcTo(x+w,y+h,x,y+h,r);this.arcTo(x,y+h,x,y,r);this.arcTo(x,y,x+w,y,r);this.closePath();return this;}; }
+  frame();
+})();
+</script>
+</body>
+</html>
