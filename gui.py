@@ -78,7 +78,7 @@ CONFIG_KEYS = [
     # 4. CUT params
     'netG', 'normG', 'gan_mode', 'netF', 'netF_nc', 'num_patches', 'nce_T',
     'nce_layers', 'lambda_GAN', 'lambda_NCE', 'nce_idt',
-    'no_antialias', 'no_antialias_up', 'lambda_grad', 'lambda_color',
+    'no_antialias', 'no_antialias_up', 'lambda_grad', 'lambda_color', 'serial_batches',
     # 5. Attention params
     'attention_type', 'attention_reduction',
     'attention_encoder', 'attention_resblocks', 'attention_decoder',
@@ -116,6 +116,7 @@ DEFAULTS = {
     'no_antialias_up': False,
     'lambda_grad': 0.0,
     'lambda_color': 0.0,
+    'serial_batches': False,
     'attention_type': 'none',
     'attention_reduction': 16,
     'attention_encoder': False,
@@ -301,6 +302,10 @@ def build_train_cmd(cfg):
            '--lambda_grad', str(float(cfg['lambda_grad'])),
            '--lambda_color', str(float(cfg['lambda_color'])),
            '--display_id', '0']    # disable visdom; we stream the console log
+    if _bool(cfg.get('serial_batches')):
+        # pair real_A[i] with real_B[i] by sorted order (for aligned SAR/optical
+        # sets); default CUT samples real_B randomly (unpaired, by design).
+        cmd.append('--serial_batches')
     cmd += _attention_args(cfg)
     return cmd
 
@@ -1272,6 +1277,14 @@ def build_ui():
             with gr.Row():
                 comp['no_antialias'] = gr.Checkbox(bool(cfg['no_antialias']), label='no_antialias (다운샘플 stride2)')
                 comp['no_antialias_up'] = gr.Checkbox(bool(cfg['no_antialias_up']), label='no_antialias_up')
+            comp['serial_batches'] = gr.Checkbox(
+                bool(cfg['serial_batches']),
+                label='serial_batches (정렬된 짝 데이터: real_A[i]↔real_B[i] 같은 순번 사용. '
+                      '끄면 CUT 기본=real_B 무작위/비짝)')
+            gr.Markdown(
+                'ℹ️ CUT는 **비짝(unpaired)** 학습이라 기본적으로 real_A(SAR)와 real_B(optical)는 '
+                '서로 다른 이미지를 참조하는 것이 정상입니다. SAR→optical 변환 결과는 **fake_B** 입니다. '
+                'SAR/optical 파일명이 1:1로 정렬된 짝 데이터라면 위 `serial_batches` 를 켜서 같은 순번끼리 묶을 수 있습니다.')
             save_cut = gr.Button('💾 CUT 파라미터 저장', variant='primary')
             save_cut_out = gr.Textbox(label='', interactive=False)
 
