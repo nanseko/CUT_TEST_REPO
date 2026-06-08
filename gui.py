@@ -419,6 +419,22 @@ def start_training(cfg_path, *values):
     STATE.running = True
     STATE.message = '학습 준비 중...'
 
+    # preflight: show exactly which folders will be loaded so a train/test or
+    # A/B folder mix-up is obvious (training reads trainA/trainB).
+    dataroot = str(cfg['dataroot'])
+    counts = {sub: len(list_images(os.path.join(dataroot, sub)))
+              for sub in ('trainA', 'trainB', 'testA', 'testB')}
+    STATE.log(f'dataroot = {os.path.abspath(dataroot)}')
+    STATE.log('폴더 이미지 수 -> ' + ', '.join(f'{k}={v}' for k, v in counts.items()))
+    STATE.log(f'학습은 trainA({counts["trainA"]}) -> trainB({counts["trainB"]}) 를 사용합니다 '
+              f'(testA/testB 는 추론용).')
+    if counts['trainA'] == 0 or counts['trainB'] == 0:
+        STATE.log('오류: trainA 또는 trainB 가 비어 있습니다. dataroot 아래 trainA/trainB 폴더를 확인하세요.')
+        STATE.running = False
+        STATE.message = '오류: 학습 폴더 비어 있음'
+        yield _format_status(STATE.snapshot())
+        return
+
     thread = threading.Thread(target=training_worker, args=(cfg, STATE), daemon=True)
     thread.start()
 

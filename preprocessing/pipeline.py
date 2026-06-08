@@ -193,9 +193,16 @@ def run_pipeline(config, max_preview=12):
     # manifest
     mf = open(manifest_path, 'w', newline='')
     writer = csv.writer(mf)
-    writer.writerow(['input_path', 'output_path', 'status', 'error',
-                     'orig_h', 'orig_w', 'out_h', 'out_w', 'steps',
-                     'p01', 'p50', 'p99', 'p998', 'zero_ratio', 'elapsed_sec'])
+
+    def wrow(row):
+        # flush after every row so manifest.csv is never empty/stale even if the
+        # run is interrupted (the UI generator may be stopped mid-way)
+        writer.writerow(row)
+        mf.flush()
+
+    wrow(['input_path', 'output_path', 'status', 'error',
+          'orig_h', 'orig_w', 'out_h', 'out_w', 'steps',
+          'p01', 'p50', 'p99', 'p998', 'zero_ratio', 'elapsed_sec'])
 
     ok, fail, skip = 0, 0, 0
     save_fmt = io.get('save_format', 'png')
@@ -225,7 +232,7 @@ def run_pipeline(config, max_preview=12):
             name = os.path.splitext(os.path.basename(path))[0]
             if ctx.get('skip'):
                 skip += 1
-                writer.writerow([path, '', 'skipped', ctx.get('skip_reason', ''),
+                wrow([path, '', 'skipped', ctx.get('skip_reason', ''),
                                  oh, ow, '', '', '|'.join(enabled_names),
                                  '', '', '', '', '', round(time.time() - t0, 3)])
                 yield log(f'건너뜀 {i+1}/{len(files)}: {os.path.basename(path)} '
@@ -241,7 +248,7 @@ def run_pipeline(config, max_preview=12):
             g = arr[..., 0].astype(np.float32) / 255.0
             p01, p50, p99, p998 = np.percentile(g, [1, 50, 99, 99.8])
             zero_ratio = float((g <= 1e-4).mean())
-            writer.writerow([path, out_path, 'success', '', oh, ow,
+            wrow([path, out_path, 'success', '', oh, ow,
                              arr.shape[0], arr.shape[1], '|'.join(enabled_names),
                              round(float(p01), 3), round(float(p50), 3),
                              round(float(p99), 3), round(float(p998), 3),
@@ -251,7 +258,7 @@ def run_pipeline(config, max_preview=12):
             failed = True
             fail += 1
             err = traceback.format_exc().splitlines()[-1]
-            writer.writerow([path, '', 'failed', err,
+            wrow([path, '', 'failed', err,
                              '', '', '', '', '|'.join(enabled_names), '', '', '', '', '',
                              round(time.time() - t0, 3)])
             # show the real error in the streamed log, not only in manifest.csv
