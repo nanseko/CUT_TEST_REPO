@@ -75,6 +75,7 @@ CONFIG_KEYS = [
     # 3. Basic training params
     'CUT_mode', 'n_epochs', 'n_epochs_decay', 'batch_size', 'lr',
     'beta1', 'beta2', 'save_epoch_freq', 'load_size', 'crop_size', 'num_threads',
+    'continue_train',
     # 4. CUT params
     'netG', 'normG', 'gan_mode', 'netF', 'netF_nc', 'num_patches', 'nce_T',
     'nce_layers', 'lambda_GAN', 'lambda_NCE', 'nce_idt',
@@ -101,6 +102,7 @@ DEFAULTS = {
     'load_size': 286,
     'crop_size': 256,
     'num_threads': 4,
+    'continue_train': False,
     'netG': 'resnet_9blocks',
     'normG': 'instance',
     'gan_mode': 'lsgan',
@@ -270,6 +272,39 @@ def _attention_args(cfg):
     return args
 
 
+def _find_last_epoch(checkpoints_dir, name):
+    """Largest N from '<N>_net_G.pth' under checkpoints_dir/name (None if absent)."""
+    d = os.path.join(str(checkpoints_dir), str(name))
+    if not os.path.isdir(d):
+        return None
+    epochs = []
+    for f in os.listdir(d):
+        m = re.match(r'(\d+)_net_G\.pth$', f)
+        if m:
+            epochs.append(int(m.group(1)))
+    return max(epochs) if epochs else None
+
+
+def _resume_args(cfg):
+    """Build --continue_train args to resume from the last saved epoch.
+
+    Returns (args, message). args is [] when resume was requested but no
+    checkpoint exists (-> start fresh).
+    """
+    if not _bool(cfg.get('continue_train')):
+        return [], None
+    ckpt = str(cfg['checkpoints_dir'])
+    name = str(cfg['name'])
+    last = _find_last_epoch(ckpt, name)
+    if last is not None:
+        return (['--continue_train', '--epoch', str(last), '--epoch_count', str(last + 1)],
+                f'이어서 학습: epoch {last} 체크포인트에서 재개 -> epoch {last+1} 부터')
+    if os.path.exists(os.path.join(ckpt, name, 'latest_net_G.pth')):
+        return (['--continue_train', '--epoch', 'latest', '--epoch_count', '1'],
+                '이어서 학습: 번호 체크포인트가 없어 latest 가중치로 재개 (epoch 카운트는 1부터)')
+    return [], '이어서 학습 요청됨 — 체크포인트를 찾지 못해 처음부터 학습합니다.'
+
+
 def build_train_cmd(cfg):
     cmd = [sys.executable, '-u', os.path.join(REPO_ROOT, 'train.py'),
            '--dataroot', str(cfg['dataroot']),
@@ -306,6 +341,7 @@ def build_train_cmd(cfg):
         # pair real_A[i] with real_B[i] by sorted order (for aligned SAR/optical
         # sets); default CUT samples real_B randomly (unpaired, by design).
         cmd.append('--serial_batches')
+    cmd += _resume_args(cfg)[0]
     cmd += _attention_args(cfg)
     return cmd
 
@@ -439,6 +475,10 @@ def start_training(cfg_path, *values):
         STATE.message = '오류: 학습 폴더 비어 있음'
         yield _format_status(STATE.snapshot())
         return
+
+    resume_msg = _resume_args(cfg)[1]
+    if resume_msg:
+        STATE.log(resume_msg)
 
     thread = threading.Thread(target=training_worker, args=(cfg, STATE), daemon=True)
     thread.start()
@@ -1250,6 +1290,13 @@ def build_ui():
             with gr.Row():
                 comp['load_size'] = gr.Number(cfg['load_size'], label='load_size', precision=0)
                 comp['crop_size'] = gr.Number(cfg['crop_size'], label='crop_size', precision=0)
+            comp['continue_train'] = gr.Checkbox(
+                bool(cfg['continue_train']),
+                label='이어서 학습 (continue_train) — 마지막 저장된 epoch 체크포인트에서 재개')
+            gr.Markdown(
+                'ℹ️ 체크 시 `checkpoints_dir/name` 의 마지막 `<N>_net_*.pth` 를 불러와 '
+                'epoch N+1 부터 이어서 학습합니다(설정은 학습 때와 동일해야 함). '
+                '체크포인트는 `save_epoch_freq` epoch마다 저장됩니다.')
             save_basic = gr.Button('💾 기본 파라미터 저장', variant='primary')
             save_basic_out = gr.Textbox(label='', interactive=False)
 
