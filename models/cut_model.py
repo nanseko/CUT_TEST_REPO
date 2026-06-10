@@ -96,15 +96,26 @@ class CUTModel(BaseModel):
         # indices shift, so the string --nce_layers (default 0,4,8,12,16) would
         # tap the wrong layers. Use the architecture's attention-aware tap
         # indices instead. (Identical to the default when attention is off.)
+        # The string default --nce_layers 0,4,8,12,16 is only correct for the
+        # plain antialiased ResNet with no attention. Attention insertion,
+        # --no_antialias, and --netG hrnet all shift (or redefine) the
+        # nn.Sequential indices. The generator exposes the correct taps via
+        # `nce_default`, so when the user has NOT customised --nce_layers we use
+        # it for every configuration; a custom value is always respected.
         attention_on = getattr(opt, 'attention_type', 'none') != 'none' and (
             opt.attention_encoder or opt.attention_resblocks or opt.attention_decoder)
-        # HRNet has its own tap indices; attention also shifts the resnet indices.
-        if attention_on or getattr(opt, 'netG', '') == 'hrnet':
-            gen = self.netG.module if hasattr(self.netG, 'module') else self.netG
-            if hasattr(gen, 'nce_default'):
-                self.nce_layers = list(gen.nce_default)
-                print('[CUT] nce_layers auto-set to %s (netG=%s, attention=%s)'
-                      % (self.nce_layers, getattr(opt, 'netG', '?'), attention_on))
+        gen = self.netG.module if hasattr(self.netG, 'module') else self.netG
+        user_set_nce = self.opt.nce_layers.replace(' ', '') != '0,4,8,12,16'
+        if hasattr(gen, 'nce_default') and not user_set_nce:
+            if list(gen.nce_default) != self.nce_layers:
+                print('[CUT] nce_layers auto-corrected %s -> %s (netG=%s, attention=%s, no_antialias=%s)'
+                      % (self.nce_layers, list(gen.nce_default), getattr(opt, 'netG', '?'),
+                         attention_on, getattr(opt, 'no_antialias', False)))
+            self.nce_layers = list(gen.nce_default)
+        elif user_set_nce and (attention_on or getattr(opt, 'netG', '') == 'hrnet'):
+            print('[CUT] 경고: attention/hrnet 사용 중 사용자 지정 --nce_layers=%s 는 '
+                  'tap 위치와 어긋날 수 있습니다. 기본값으로 두면 자동 보정됩니다 (권장 %s).'
+                  % (self.opt.nce_layers, list(getattr(gen, 'nce_default', []))))
 
         if self.isTrain:
             self.netD = networks.define_D(opt.output_nc, opt.ndf, opt.netD, opt.n_layers_D, opt.normD, opt.init_type, opt.init_gain, opt.no_antialias, self.gpu_ids, opt)
