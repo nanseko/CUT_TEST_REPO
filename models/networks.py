@@ -262,6 +262,8 @@ def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, in
         net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, no_antialias=no_antialias, no_antialias_up=no_antialias_up, n_blocks=6, opt=opt, **attn_kwargs)
     elif netG == 'resnet_4blocks':
         net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, no_antialias=no_antialias, no_antialias_up=no_antialias_up, n_blocks=4, opt=opt, **attn_kwargs)
+    elif netG == 'hrnet':
+        net = HRNetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, opt=opt, **attn_kwargs)
     elif netG == 'unet_128':
         net = UnetGenerator(input_nc, output_nc, 7, ngf, norm_layer=norm_layer, use_dropout=use_dropout)
     elif netG == 'unet_256':
@@ -1059,6 +1061,160 @@ class ResnetGenerator(nn.Module):
             """Standard forward"""
             fake = self.model(input)
             return fake
+
+
+class HRResBlock(nn.Module):
+    """Residual block (two 3x3 convs) with optional attention, used in HRNet branches."""
+    def __init__(self, dim, norm_layer, use_bias, attention_type='none', attention_reduction=16):
+        super(HRResBlock, self).__init__()
+        self.body = nn.Sequential(
+            nn.ReflectionPad2d(1), nn.Conv2d(dim, dim, kernel_size=3, bias=use_bias),
+            norm_layer(dim), nn.ReLU(True),
+            nn.ReflectionPad2d(1), nn.Conv2d(dim, dim, kernel_size=3, bias=use_bias),
+            norm_layer(dim))
+        self.attention = make_attention(attention_type, dim, attention_reduction)
+        self.act = nn.ReLU(True)
+
+    def forward(self, x):
+        return self.act(x + self.attention(self.body(x)))
+
+
+class HRFusion(nn.Module):
+    """Multi-resolution fusion: every branch receives info from all other branches.
+
+    For target branch i, each source branch j (j != i) is mapped to i's channel
+    count with a 1x1 conv and bilinearly resized to i's resolution, then summed.
+    """
+    def __init__(self, chans, norm_layer, use_bias):
+        super(HRFusion, self).__init__()
+        self.n = len(chans)
+        self.convs = nn.ModuleDict()
+        for i in range(self.n):
+            for j in range(self.n):
+                if i != j:
+                    self.convs['%d_%d' % (i, j)] = nn.Conv2d(chans[j], chans[i], kernel_size=1, bias=use_bias)
+        self.norms = nn.ModuleList([norm_layer(chans[i]) for i in range(self.n)])
+        self.act = nn.ReLU(True)
+
+    def forward(self, xs):
+        outs = []
+        for i in range(self.n):
+            size = xs[i].shape[-2:]
+            acc = xs[i]
+            for j in range(self.n):
+                if i == j:
+                    continue
+                y = self.convs['%d_%d' % (i, j)](xs[j])
+                if y.shape[-2:] != size:
+                    y = F.interpolate(y, size=size, mode='bilinear', align_corners=False)
+                acc = acc + y
+            outs.append(self.act(self.norms[i](acc)))
+        return outs
+
+
+class HRNetGenerator(nn.Module):
+    """HRNet-style generator that keeps a full-resolution stream throughout.
+
+    Unlike the ResNet generator (which processes everything at 1/4 resolution and
+    blurs fine detail on upsampling), this maintains parallel multi-resolution
+    branches (1, 1/2, 1/4) with repeated fusion, so edges around strong SAR
+    reflectors are preserved instead of smeared.
+
+    CUT-compatible: forward(input, layers=[], encode_only=False) taps multi-scale
+    features and `self.nce_default` gives the correct PatchNCE tap ids. Optional
+    CBAM / Coordinate attention is reused from models/attention.py.
+    """
+    def __init__(self, input_nc, output_nc, ngf=64, norm_layer=nn.InstanceNorm2d,
+                 n_branches=3, n_modules=3, n_blocks=2, opt=None,
+                 attention_type='none', attention_reduction=16,
+                 attention_encoder=False, attention_resblocks=False, attention_decoder=False):
+        super(HRNetGenerator, self).__init__()
+        self.opt = opt
+        if type(norm_layer) == functools.partial:
+            use_bias = norm_layer.func == nn.InstanceNorm2d
+        else:
+            use_bias = norm_layer == nn.InstanceNorm2d
+
+        chans = [ngf * (2 ** i) for i in range(n_branches)]   # e.g. [64,128,256]
+        res_attn = attention_type if attention_resblocks else 'none'
+
+        # ---- full-resolution stem ----
+        self.stem_pad = nn.ReflectionPad2d(3)
+        stem = [nn.Conv2d(input_nc, chans[0], kernel_size=7, bias=use_bias),
+                norm_layer(chans[0]), nn.ReLU(True)]
+        if attention_type != 'none' and attention_encoder:
+            stem.append(make_attention(attention_type, chans[0], attention_reduction))
+        self.stem = nn.Sequential(*stem)
+
+        # ---- transitions that create the lower-resolution branches ----
+        self.transitions = nn.ModuleList()
+        for i in range(1, n_branches):
+            self.transitions.append(nn.Sequential(
+                nn.Conv2d(chans[i - 1], chans[i], kernel_size=3, stride=2, padding=1, bias=use_bias),
+                norm_layer(chans[i]), nn.ReLU(True)))
+
+        # ---- parallel multi-resolution modules with fusion ----
+        self.stage_blocks = nn.ModuleList()
+        self.fusions = nn.ModuleList()
+        for _ in range(n_modules):
+            branch_blocks = nn.ModuleList()
+            for i in range(n_branches):
+                branch_blocks.append(nn.Sequential(*[
+                    HRResBlock(chans[i], norm_layer, use_bias, res_attn, attention_reduction)
+                    for _ in range(n_blocks)]))
+            self.stage_blocks.append(branch_blocks)
+            self.fusions.append(HRFusion(chans, norm_layer, use_bias))
+
+        # ---- fuse all branches back to the high-resolution stream + head ----
+        self.to_hr = nn.ModuleList([nn.Conv2d(chans[i], chans[0], kernel_size=1, bias=use_bias)
+                                    for i in range(n_branches)])
+        self.to_hr_norm = norm_layer(chans[0])
+        self.to_hr_act = nn.ReLU(True)
+        head = []
+        if attention_type != 'none' and attention_decoder:
+            head.append(make_attention(attention_type, chans[0], attention_reduction))
+        head += [nn.ReflectionPad2d(3), nn.Conv2d(chans[0], output_nc, kernel_size=7), nn.Tanh()]
+        self.head = nn.Sequential(*head)
+
+        self.n_branches = n_branches
+        self.n_modules = n_modules
+        # PatchNCE taps: 0=pixels, 1=stem(HR), 2/3/4 = HR/mid/low after first module
+        self.nce_default = [0, 1, 2, 3, 4]
+
+    def _fuse_to_hr(self, xs):
+        size = xs[0].shape[-2:]
+        acc = self.to_hr[0](xs[0])
+        for i in range(1, self.n_branches):
+            y = self.to_hr[i](xs[i])
+            if y.shape[-2:] != size:
+                y = F.interpolate(y, size=size, mode='bilinear', align_corners=False)
+            acc = acc + y
+        return self.to_hr_act(self.to_hr_norm(acc))
+
+    def forward(self, input, layers=[], encode_only=False):
+        feats = {}
+        p = self.stem_pad(input)
+        feats[0] = p                     # pixel-level
+        hr = self.stem(p)
+        feats[1] = hr                    # stem features (full res)
+
+        xs = [hr]
+        for t in self.transitions:
+            xs.append(t(xs[-1]))         # build 1/2, 1/4 branches
+
+        for m in range(self.n_modules):
+            xs = [self.stage_blocks[m][i](xs[i]) for i in range(self.n_branches)]
+            xs = self.fusions[m](xs)
+            if m == 0:
+                for i in range(self.n_branches):
+                    feats[2 + i] = xs[i]   # multi-scale taps
+                if encode_only and layers:
+                    return [feats[i] for i in layers]
+
+        out = self.head(self._fuse_to_hr(xs))
+        if layers:
+            return out, [feats[i] for i in layers]
+        return out
 
 
 class ResnetDecoder(nn.Module):

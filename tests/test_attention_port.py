@@ -19,8 +19,8 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from models.attention import CBAM, CoordinateAttention, make_attention
-from models.networks import ResnetGenerator
-from models.losses_extra import gradient_loss, color_moment_loss
+from models.networks import ResnetGenerator, HRNetGenerator
+from models.losses_extra import gradient_loss, laplacian_loss, color_moment_loss
 
 
 def test_attention_shapes():
@@ -47,17 +47,34 @@ def test_generator(attention_type, **flags):
           f"feat shapes={[tuple(f.shape[1:]) for f in feats]}")
 
 
+def test_hrnet(attention_type, **flags):
+    g = HRNetGenerator(3, 3, ngf=32, norm_layer=nn.InstanceNorm2d,
+                       attention_type=attention_type, **flags)
+    x = torch.randn(1, 3, 256, 256)
+    y = g(x)
+    assert y.shape == (1, 3, 256, 256), y.shape
+    nce = g.nce_default
+    feats = g(x, layers=nce, encode_only=True)
+    assert isinstance(feats, list) and len(feats) == len(nce)
+    assert all(f.dim() == 4 for f in feats)
+    # HRNet keeps a full-resolution stream: an early tap must still be 256x256
+    assert feats[2].shape[-1] == 256, feats[2].shape
+    print(f"hrnet[{attention_type}, {flags}] OK | nce_layers={nce} | "
+          f"feat shapes={[tuple(f.shape[1:]) for f in feats]}")
+
+
 def test_losses():
     a = torch.randn(1, 3, 64, 64).clamp(-1, 1)
     b = torch.randn(1, 3, 64, 64).clamp(-1, 1)
     gl = gradient_loss(a, b)
+    ll = laplacian_loss(a, b, blur=False)
     cl = color_moment_loss(a, b)
-    assert gl.item() >= 0 and cl.item() >= 0
-    # gradients flow
+    assert gl.item() >= 0 and ll.item() >= 0 and cl.item() >= 0
+    # gradients flow through all three
     a = a.requires_grad_(True)
-    (gradient_loss(a, b) + color_moment_loss(a, b)).backward()
+    (gradient_loss(a, b, blur=False) + laplacian_loss(a, b) + color_moment_loss(a, b)).backward()
     assert a.grad is not None
-    print(f'losses: grad={gl.item():.4f} color={cl.item():.4f} | backward OK')
+    print(f'losses: grad={gl.item():.4f} lap={ll.item():.4f} color={cl.item():.4f} | backward OK')
 
 
 def main():
@@ -66,6 +83,8 @@ def main():
     test_generator('coord', attention_encoder=True, attention_resblocks=True)
     test_generator('cbam', attention_encoder=True, attention_resblocks=True, attention_decoder=True)
     test_generator('coord', attention_encoder=True, attention_resblocks=True, no_antialias=True)
+    test_hrnet('none')
+    test_hrnet('coord', attention_encoder=True, attention_resblocks=True)
     test_losses()
     print('\nAll attention-integration smoke tests passed.')
 

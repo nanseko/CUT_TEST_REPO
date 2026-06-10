@@ -79,7 +79,8 @@ CONFIG_KEYS = [
     # 4. CUT params
     'netG', 'normG', 'gan_mode', 'netF', 'netF_nc', 'num_patches', 'nce_T',
     'nce_layers', 'lambda_GAN', 'lambda_NCE', 'nce_idt',
-    'no_antialias', 'no_antialias_up', 'lambda_grad', 'lambda_color', 'serial_batches',
+    'no_antialias', 'no_antialias_up', 'lambda_grad', 'lambda_lap', 'grad_no_blur',
+    'lambda_color', 'serial_batches',
     # 5. Attention params
     'attention_type', 'attention_reduction',
     'attention_encoder', 'attention_resblocks', 'attention_decoder',
@@ -117,6 +118,8 @@ DEFAULTS = {
     'no_antialias': False,
     'no_antialias_up': False,
     'lambda_grad': 0.0,
+    'lambda_lap': 0.0,
+    'grad_no_blur': False,
     'lambda_color': 0.0,
     'serial_batches': False,
     'attention_type': 'none',
@@ -335,8 +338,11 @@ def build_train_cmd(cfg):
            '--lambda_NCE', str(float(cfg['lambda_NCE'])),
            '--nce_idt', 'True' if _bool(cfg['nce_idt']) else 'False',
            '--lambda_grad', str(float(cfg['lambda_grad'])),
+           '--lambda_lap', str(float(cfg.get('lambda_lap', 0.0))),
            '--lambda_color', str(float(cfg['lambda_color'])),
            '--display_id', '0']    # disable visdom; we stream the console log
+    if _bool(cfg.get('grad_no_blur')):
+        cmd.append('--grad_no_blur')
     if _bool(cfg.get('serial_batches')):
         # pair real_A[i] with real_B[i] by sorted order (for aligned SAR/optical
         # sets); default CUT samples real_B randomly (unpaired, by design).
@@ -1303,8 +1309,9 @@ def build_ui():
         # ---- Tab 4 : CUT params ---------------------------------------- #
         with gr.Tab('4. CUT 파라미터'):
             with gr.Row():
-                comp['netG'] = gr.Dropdown(['resnet_9blocks', 'resnet_6blocks', 'resnet_4blocks'],
-                                           value=cfg['netG'], label='netG')
+                comp['netG'] = gr.Dropdown(['resnet_9blocks', 'resnet_6blocks', 'resnet_4blocks', 'hrnet'],
+                                           value=cfg['netG'],
+                                           label='netG (hrnet = 고해상도 보존, 강반사체 블러↓)')
                 comp['normG'] = gr.Dropdown(['instance', 'batch', 'none'], value=cfg['normG'], label='normG')
                 comp['gan_mode'] = gr.Dropdown(['lsgan', 'nonsaturating', 'vanilla'], value=cfg['gan_mode'], label='gan_mode')
             with gr.Row():
@@ -1319,8 +1326,15 @@ def build_ui():
                 comp['lambda_GAN'] = gr.Number(cfg['lambda_GAN'], label='lambda_GAN')
                 comp['lambda_NCE'] = gr.Number(cfg['lambda_NCE'], label='lambda_NCE')
             with gr.Row():
-                comp['lambda_grad'] = gr.Number(cfg['lambda_grad'], label='lambda_grad (구조 보존)')
+                comp['lambda_grad'] = gr.Number(cfg['lambda_grad'], label='lambda_grad (구조/에지 보존)')
+                comp['lambda_lap'] = gr.Number(cfg['lambda_lap'], label='lambda_lap (고주파/라플라시안, 블러↓)')
                 comp['lambda_color'] = gr.Number(cfg['lambda_color'], label='lambda_color (색 일관성, nce_idt 필요)')
+            comp['grad_no_blur'] = gr.Checkbox(
+                bool(cfg['grad_no_blur']),
+                label='grad_no_blur (구조 손실에서 입력 블러 끔 → 더 날카로운 에지 타깃)')
+            gr.Markdown(
+                'ℹ️ 강반사체 주변 블러가 심하면: `netG=hrnet` + `lambda_grad`(예 1.0) + `lambda_lap`(예 0.5) + '
+                '`grad_no_blur` 체크를 함께 써보세요. 너무 강하면 결과가 SAR처럼 밋밋해질 수 있으니 값으로 조절하세요.')
             with gr.Row():
                 comp['no_antialias'] = gr.Checkbox(bool(cfg['no_antialias']), label='no_antialias (다운샘플 stride2)')
                 comp['no_antialias_up'] = gr.Checkbox(bool(cfg['no_antialias_up']), label='no_antialias_up')

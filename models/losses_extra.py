@@ -23,7 +23,11 @@ def _luminance(x):
 
 
 def gradient_loss(source, generated, blur=True):
-    """L1 between input/output spatial gradients; source blurred to ignore speckle."""
+    """L1 between input/output spatial gradients; source blurred to ignore speckle.
+
+    Set ``blur=False`` for sharper edge targets (keeps strong reflector edges
+    instead of softening them), at the cost of letting some SAR speckle through.
+    """
     gs = _luminance(source)
     gg = _luminance(generated)
     if blur:
@@ -33,6 +37,28 @@ def gradient_loss(source, generated, blur=True):
     g_dx = gg[:, :, :, 1:] - gg[:, :, :, :-1]
     g_dy = gg[:, :, 1:, :] - gg[:, :, :-1, :]
     return (s_dx - g_dx).abs().mean() + (s_dy - g_dy).abs().mean()
+
+
+def _laplacian(x):
+    """4-neighbour Laplacian (second derivative) of a single-channel NCHW map."""
+    k = torch.tensor([[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]],
+                     device=x.device, dtype=x.dtype).view(1, 1, 3, 3)
+    xp = F.pad(x, (1, 1, 1, 1), mode='reflect')
+    return F.conv2d(xp, k)
+
+
+def laplacian_loss(source, generated, blur=False):
+    """L1 between input/output Laplacians (high-frequency / fine-edge term).
+
+    The Laplacian is large at sharp points/edges and ~0 on smooth regions, so a
+    blurred output (low Laplacian) where the input is sharp is penalised. This
+    directly discourages the blur that appears around strong SAR reflectors.
+    """
+    gs = _luminance(source)
+    gg = _luminance(generated)
+    if blur:
+        gs = F.avg_pool2d(gs, kernel_size=3, stride=1, padding=1)
+    return (_laplacian(gs) - _laplacian(gg)).abs().mean()
 
 
 def color_moment_loss(generated, reference):
