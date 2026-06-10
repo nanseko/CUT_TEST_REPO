@@ -88,7 +88,7 @@ def default_config():
             'input_dir': './datasets/M4-SAR/raw_sar',
             'output_dir': './datasets/M4-SAR-preprocessed',
             'recursive': True, 'shuffle': False, 'seed': 42,
-            'max_items': 0, 'save_format': 'png',
+            'max_items': 0, 'save_format': 'png', 'num_workers': 1,
         },
         'pipeline': {'steps': [
             {'name': 'validate_image', 'enabled': True,
@@ -125,6 +125,74 @@ def build_steps(step_cfgs):
         steps.append(STEP_REGISTRY[name](enabled=sc.get('enabled', True),
                                          **(sc.get('params') or {})))
     return steps
+
+
+# --------------------------------------------------------------------------- #
+# Parallel worker (used when io.num_workers > 1). Top-level so it is picklable
+# under the Windows 'spawn' start method.
+# --------------------------------------------------------------------------- #
+
+_PAR = {}
+
+
+def _par_init(config, optical_target, img_dir, prev_dir, save_fmt, max_preview):
+    _PAR['steps'] = build_steps(config['pipeline']['steps'])
+    _PAR['opt'] = optical_target
+    _PAR['img_dir'] = img_dir
+    _PAR['prev_dir'] = prev_dir
+    _PAR['save_fmt'] = save_fmt
+    _PAR['max_preview'] = max_preview
+
+
+def _par_process(item):
+    """Process one image in a worker; returns a small metadata dict (no arrays)."""
+    from PIL import Image
+    i, path = item
+    t0 = time.time()
+    try:
+        raw = _load_gray(path)
+        oh, ow = raw.shape[:2]
+        ctx = {'input_path': path, 'optical_target': _PAR['opt'], 'stats': {}, 'skip': False}
+        img = raw
+        for s in _PAR['steps']:
+            if not s.enabled:
+                continue
+            try:
+                img, ctx = s.apply(img, ctx)
+            except Exception as exc:
+                raise RuntimeError(f"step '{s.name}' 실패: {exc}") from exc
+            if ctx.get('skip'):
+                break
+        name = os.path.splitext(os.path.basename(path))[0]
+        if ctx.get('skip'):
+            return {'i': i, 'path': path, 'status': 'skipped',
+                    'reason': ctx.get('skip_reason', ''), 'oh': oh, 'ow': ow,
+                    'elapsed': time.time() - t0}
+        arr = img if getattr(img, 'dtype', None) == np.uint8 else (np.clip(img, 0, 1) * 255).astype(np.uint8)
+        if arr.ndim == 2:
+            arr = np.stack([arr] * 3, -1)
+        out_path = os.path.join(_PAR['img_dir'], f'{name}.{_PAR["save_fmt"]}')
+        Image.fromarray(arr).save(out_path)
+        g = arr[..., 0].astype(np.float32) / 255.0
+        p01, p50, p99, p998 = np.percentile(g, [1, 50, 99, 99.8])
+        preview = None
+        if i < _PAR['max_preview']:
+            try:
+                before = (np.clip(_safe_gray01(raw), 0, 1) * 255).astype(np.uint8)
+                bH = arr.shape[0]
+                before = np.asarray(Image.fromarray(before).resize((bH, bH)))
+                pair = np.concatenate([np.stack([before] * 3, -1), arr], axis=1)
+                preview = os.path.join(_PAR['prev_dir'], f'{name}_ba.png')
+                Image.fromarray(pair).save(preview)
+            except Exception:
+                preview = None
+        return {'i': i, 'path': path, 'status': 'success', 'out_path': out_path,
+                'oh': oh, 'ow': ow, 'oh2': int(arr.shape[0]), 'ow2': int(arr.shape[1]),
+                'p01': float(p01), 'p50': float(p50), 'p99': float(p99), 'p998': float(p998),
+                'zero': float((g <= 1e-4).mean()), 'preview': preview, 'elapsed': time.time() - t0}
+    except Exception:
+        return {'i': i, 'path': path, 'status': 'failed',
+                'error': traceback.format_exc().splitlines()[-1], 'elapsed': time.time() - t0}
 
 
 # --------------------------------------------------------------------------- #
@@ -200,12 +268,72 @@ def run_pipeline(config, max_preview=12):
         writer.writerow(row)
         mf.flush()
 
-    wrow(['input_path', 'output_path', 'status', 'error',
-          'orig_h', 'orig_w', 'out_h', 'out_w', 'steps',
-          'p01', 'p50', 'p99', 'p998', 'zero_ratio', 'elapsed_sec'])
+    header_row = ['input_path', 'output_path', 'status', 'error',
+                  'orig_h', 'orig_w', 'out_h', 'out_w', 'steps',
+                  'p01', 'p50', 'p99', 'p998', 'zero_ratio', 'elapsed_sec']
+    wrow(header_row)
 
     ok, fail, skip = 0, 0, 0
     save_fmt = io.get('save_format', 'png')
+    steps_str = '|'.join(enabled_names)
+
+    # ----- optional parallel processing (io.num_workers > 1) ----- #
+    num_workers = max(1, int(io.get('num_workers', 1) or 1))
+    if num_workers > 1:
+        yield log(f'병렬 전처리 시작: {num_workers} workers '
+                  f'(문제가 생기면 자동으로 순차 처리로 전환합니다)'), previews[-max_preview:]
+        try:
+            from concurrent.futures import ProcessPoolExecutor
+            n = len(files)
+            step = max(1, n // 50)
+            with ProcessPoolExecutor(max_workers=num_workers, initializer=_par_init,
+                                     initargs=(config, optical_target, img_dir, prev_dir,
+                                               save_fmt, max_preview)) as ex:
+                for res in ex.map(_par_process, list(enumerate(files))):
+                    i = res['i']
+                    base = os.path.basename(res['path'])
+                    if res['status'] == 'skipped':
+                        skip += 1
+                        wrow([res['path'], '', 'skipped', res.get('reason', ''),
+                              res['oh'], res['ow'], '', '', steps_str,
+                              '', '', '', '', '', round(res['elapsed'], 3)])
+                    elif res['status'] == 'failed':
+                        fail += 1
+                        wrow([res['path'], '', 'failed', res['error'], '', '', '', '',
+                              steps_str, '', '', '', '', '', round(res['elapsed'], 3)])
+                        yield log(f'실패 {i+1}/{n}: {base} -> {res["error"]}'), previews[-max_preview:]
+                    else:
+                        ok += 1
+                        wrow([res['path'], res['out_path'], 'success', '', res['oh'], res['ow'],
+                              res['oh2'], res['ow2'], steps_str,
+                              round(res['p01'], 3), round(res['p50'], 3), round(res['p99'], 3),
+                              round(res['p998'], 3), round(res['zero'], 4), round(res['elapsed'], 3)])
+                        if res.get('preview') and len(previews) < max_preview:
+                            previews.append(res['preview'])
+                    done = ok + skip + fail
+                    if done % step == 0 or done == n:
+                        yield log(f'완료 {done}/{n} (성공 {ok} / 건너뜀 {skip} / 실패 {fail})'), previews[-max_preview:]
+            mf.close()
+            try:
+                with open(os.path.join(out_dir, 'pipeline_config.resolved.json'), 'w') as f:
+                    json.dump(config, f, indent=2, default=str)
+            except Exception:
+                pass
+            yield log(f'완료(병렬): 성공 {ok}, 건너뜀 {skip}, 실패 {fail} -> {img_dir}\n'
+                      f'manifest: {manifest_path}'), previews[-max_preview:]
+            return
+        except Exception:
+            yield log('병렬 처리를 시작할 수 없어 순차 처리로 전환합니다:\n'
+                      + traceback.format_exc().splitlines()[-1]), previews[-max_preview:]
+            ok, fail, skip = 0, 0, 0
+            previews = []
+            try:
+                mf.seek(0)
+                mf.truncate()
+                wrow(header_row)
+            except Exception:
+                pass
+
     for i, path in enumerate(files):
         # log BEFORE processing so a hang/very-slow file is visible (the last
         # "▶ ... 처리 시작" line points at the offending file/step).

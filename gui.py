@@ -996,11 +996,12 @@ def pp_apply(steps, sel, method, window, enl_auto, enl_val, damp, sig_auto, sig_
     return steps, _pp_rows(steps)
 
 
-def _pp_config_from_steps(input_dir, output_dir, max_items, recursive, shuffle, steps):
+def _pp_config_from_steps(input_dir, output_dir, max_items, recursive, shuffle, steps, num_workers=1):
     return {
         'io': {'input_dir': input_dir, 'output_dir': output_dir,
                'max_items': int(max_items or 0), 'recursive': bool(recursive),
-               'shuffle': bool(shuffle), 'seed': 42, 'save_format': 'png'},
+               'shuffle': bool(shuffle), 'seed': 42, 'save_format': 'png',
+               'num_workers': max(1, int(num_workers or 1))},
         'pipeline': {'steps': [{'name': s['name'], 'enabled': s.get('enabled', True),
                                 'params': s['params']} for s in steps]},
     }
@@ -1019,10 +1020,10 @@ def pp_load_settings():
     return {}
 
 
-def pp_save_settings(steps, input_dir, output_dir, max_items, recursive, shuffle):
+def pp_save_settings(steps, input_dir, output_dir, max_items, recursive, shuffle, num_workers=1):
     data = {'input_dir': input_dir, 'output_dir': output_dir,
             'max_items': int(max_items or 0), 'recursive': bool(recursive),
-            'shuffle': bool(shuffle), 'steps': steps}
+            'shuffle': bool(shuffle), 'num_workers': max(1, int(num_workers or 1)), 'steps': steps}
     try:
         with open(PP_CONFIG_PATH, 'w') as f:
             json.dump(data, f, indent=2, default=str)
@@ -1030,17 +1031,17 @@ def pp_save_settings(steps, input_dir, output_dir, max_items, recursive, shuffle
         pass
 
 
-def pp_save_btn_fn(steps, input_dir, output_dir, max_items, recursive, shuffle):
-    pp_save_settings(steps, input_dir, output_dir, max_items, recursive, shuffle)
+def pp_save_btn_fn(steps, input_dir, output_dir, max_items, recursive, shuffle, num_workers):
+    pp_save_settings(steps, input_dir, output_dir, max_items, recursive, shuffle, num_workers)
     return f'✅ 전처리 설정 저장됨: {PP_CONFIG_PATH} ({datetime.datetime.now().strftime("%H:%M:%S")})'
 
 
-def pp_preview(steps, input_dir, output_dir, max_items, recursive, shuffle):
+def pp_preview(steps, input_dir, output_dir, max_items, recursive, shuffle, num_workers):
     import preprocessing as PP
-    pp_save_settings(steps, input_dir, output_dir, max_items, recursive, shuffle)
+    pp_save_settings(steps, input_dir, output_dir, max_items, recursive, shuffle, num_workers)
     if not steps:
         return None, None, '파이프라인에 스텝이 없습니다. 스텝을 추가하세요.'
-    cfg = _pp_config_from_steps(input_dir, output_dir, max_items, recursive, shuffle, steps)
+    cfg = _pp_config_from_steps(input_dir, output_dir, max_items, recursive, shuffle, steps, num_workers)
     files = PP.scan_images(input_dir, bool(recursive), False, 42, 1)
     if not files:
         return None, None, '입력 폴더에 이미지가 없습니다.'
@@ -1051,13 +1052,13 @@ def pp_preview(steps, input_dir, output_dir, max_items, recursive, shuffle):
         return None, None, '미리보기 오류:\n' + traceback.format_exc()
 
 
-def pp_run(steps, input_dir, output_dir, max_items, recursive, shuffle):
+def pp_run(steps, input_dir, output_dir, max_items, recursive, shuffle, num_workers):
     import preprocessing as PP
-    pp_save_settings(steps, input_dir, output_dir, max_items, recursive, shuffle)
+    pp_save_settings(steps, input_dir, output_dir, max_items, recursive, shuffle, num_workers)
     if not steps:
         yield '파이프라인에 스텝이 없습니다.', []
         return
-    cfg = _pp_config_from_steps(input_dir, output_dir, max_items, recursive, shuffle, steps)
+    cfg = _pp_config_from_steps(input_dir, output_dir, max_items, recursive, shuffle, steps, num_workers)
     try:
         for log, prev in PP.run_pipeline(cfg):
             yield log, prev
@@ -1169,6 +1170,8 @@ def build_ui():
                     pp_max = gr.Number(_pps.get('max_items', 20), label='처리 개수 (0=전체)', precision=0)
                     pp_recursive = gr.Checkbox(_pps.get('recursive', True), label='하위 폴더 포함')
                     pp_shuffle = gr.Checkbox(_pps.get('shuffle', False), label='섞기(shuffle)')
+                    pp_workers = gr.Number(_pps.get('num_workers', 1),
+                                           label='병렬 처리 수 num_workers (1=순차, CPU 코어수 권장)', precision=0)
                 with gr.Row():
                     pp_save_btn = gr.Button('💾 전처리 설정 저장 (폴더/순서 보존)')
                     pp_save_msg = gr.Textbox(label='', interactive=False)
@@ -1248,7 +1251,7 @@ def build_ui():
             pp_apply_btn.click(pp_apply, inputs=[pp_steps, pp_sel] + edit_widgets,
                                outputs=[pp_steps, pp_table])
 
-            pp_io_inputs = [pp_steps, pp_in, pp_out, pp_max, pp_recursive, pp_shuffle]
+            pp_io_inputs = [pp_steps, pp_in, pp_out, pp_max, pp_recursive, pp_shuffle, pp_workers]
             pp_save_btn.click(pp_save_btn_fn, inputs=pp_io_inputs, outputs=pp_save_msg)
 
             with gr.Accordion('⑤ 미리보기 (Before / After)', open=True):
