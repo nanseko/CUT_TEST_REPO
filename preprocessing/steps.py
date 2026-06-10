@@ -246,7 +246,9 @@ class HistogramMappingStep(PreprocessStep):
         bins = int(self.params.get('bins', 1024))
         mode = self.params.get('mode', 'sar_only')
 
-        if mode == 'unpaired_optical_reference' and context.get('optical_target') is not None:
+        # 'unpaired_optical_reference' (folder, built at runtime) and 'preset'
+        # (pre-trained .npy, loaded at runtime) both supply context optical_target.
+        if mode in ('unpaired_optical_reference', 'preset') and context.get('optical_target') is not None:
             tx, ty = context['optical_target']
         else:
             tx, ty = optical_like_v1_cdf(bins)

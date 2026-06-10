@@ -829,6 +829,7 @@ def _default_step(category):
     if category == 'histogram':
         return {'name': 'histogram_mapping', 'enabled': True,
                 'params': {'mode': 'sar_only', 'bins': 1024, 'optical_reference_dir': None,
+                           'reference_cdf_path': None,
                            'clahe': {'enabled': False, 'clip_limit': 2.0, 'tile_grid_size': [8, 8]}},
                 'label': 'histogram: sar_only'}
     if category == 'resize':
@@ -898,7 +899,7 @@ def pp_on_select(steps, evt: gr.SelectData):
     except Exception:
         row = 0
     if not steps or row >= len(steps):
-        return [gr.update()] * 26
+        return [gr.update()] * 27
     s = steps[row]
     name = s['name']
     p = s.get('params', {})
@@ -919,6 +920,7 @@ def pp_on_select(steps, evt: gr.SelectData):
     histmode = p.get('mode', 'sar_only') if name == 'histogram_mapping' else 'sar_only'
     bins = int(p.get('bins', 1024))
     optref = p.get('optical_reference_dir') or ''
+    refcdf = p.get('reference_cdf_path') or ''
     clahe = bool((p.get('clahe', {}) or {}).get('enabled', False))
     size = int(p.get('image_size', 256))
     ch = int(p.get('output_channels', 3))
@@ -964,11 +966,12 @@ def pp_on_select(steps, evt: gr.SelectData):
         gr.update(value=clahe),
         gr.update(value=size),
         gr.update(value=ch),
+        gr.update(value=refcdf),
     ]
 
 
 def pp_apply(steps, sel, method, window, enl_auto, enl_val, damp, sig_auto, sig_val,
-             intmode, cmin, cmax, ign, histmode, bins, optref, clahe, size, ch):
+             intmode, cmin, cmax, ign, histmode, bins, optref, clahe, size, ch, refcdf):
     steps = list(steps)
     i = int(sel)
     if not (0 <= i < len(steps)):
@@ -988,6 +991,7 @@ def pp_apply(steps, sel, method, window, enl_auto, enl_val, damp, sig_auto, sig_
     elif name == 'histogram_mapping':
         steps[i]['params'] = {'mode': histmode, 'bins': int(bins),
                               'optical_reference_dir': (optref or None),
+                              'reference_cdf_path': (refcdf or None),
                               'clahe': {'enabled': bool(clahe), 'clip_limit': 2.0,
                                         'tile_grid_size': [8, 8]}}
         steps[i]['label'] = f'histogram: {histmode}'
@@ -1068,6 +1072,22 @@ def pp_run(steps, input_dir, output_dir, max_items, recursive, shuffle, num_work
             yield log, prev
     except Exception:
         yield ('전처리 중 예외:\n' + traceback.format_exc(), [])
+
+
+def pp_train_reference(optical_dir, save_path, bins, max_items):
+    """Pre-train: build the optical histogram CDF and save it to .npy for preset use."""
+    import preprocessing as PP
+    if not optical_dir or not os.path.isdir(optical_dir):
+        return f'오류: Optical 폴더가 없습니다: {optical_dir}'
+    save_path = (save_path or './optical_hist.npy').strip()
+    try:
+        path, nbins = PP.save_reference_cdf(optical_dir, save_path,
+                                            bins=int(bins or 1024), max_items=int(max_items or 0))
+        return (f'✅ 사전 히스토그램 저장 완료: {os.path.abspath(path)}  (bins={nbins})\n'
+                f'→ histogram_mapping 스텝을 모드 "preset" 으로 두고 '
+                f'"사전 히스토그램 .npy 경로" 에 위 경로를 넣으면 SAR만으로 매핑됩니다.')
+    except Exception:
+        return '사전 히스토그램 학습 실패:\n' + traceback.format_exc()
 
 
 def pp_metrics(output_dir, max_items):
@@ -1238,10 +1258,12 @@ def build_ui():
                         e_ign = gr.Checkbox(True, label='0값 제외')
                 with gr.Group(visible=False) as g_hist:
                     with gr.Row():
-                        e_histmode = gr.Dropdown(PP.HISTOGRAM_MODES, value='sar_only', label='histogram 모드')
+                        e_histmode = gr.Dropdown(PP.HISTOGRAM_MODES, value='sar_only',
+                                                 label='histogram 모드 (sar_only / unpaired_optical_reference / preset)')
                         e_bins = gr.Number(1024, label='bins', precision=0)
                         e_clahe = gr.Checkbox(False, label='CLAHE')
-                    e_optref = gr.Textbox('', label='Optical 참조 폴더 (unpaired 모드)')
+                    e_optref = gr.Textbox('', label='Optical 참조 폴더 (unpaired_optical_reference 모드)')
+                    e_refcdf = gr.Textbox('', label='사전 히스토그램 .npy 경로 (preset 모드: 아래 ④에서 먼저 학습/저장)')
                 with gr.Group(visible=False) as g_resize:
                     e_size = gr.Number(256, label='resize image_size', precision=0)
                 with gr.Group(visible=False) as g_chan:
@@ -1250,7 +1272,7 @@ def build_ui():
 
             edit_widgets = [e_method, e_window, e_enlauto, e_enlval, e_damp, e_sigauto,
                             e_sigval, e_intmode, e_cmin, e_cmax, e_ign, e_histmode,
-                            e_bins, e_optref, e_clahe, e_size, e_ch]
+                            e_bins, e_optref, e_clahe, e_size, e_ch, e_refcdf]
             edit_groups = [g_spk, g_int, g_clip, g_hist, g_resize, g_chan]
 
             pp_add_btn.click(pp_add_category, inputs=[pp_steps, pp_addcat, pp_sel],
@@ -1271,6 +1293,23 @@ def build_ui():
 
             pp_io_inputs = [pp_steps, pp_in, pp_out, pp_max, pp_recursive, pp_shuffle, pp_workers]
             pp_save_btn.click(pp_save_btn_fn, inputs=pp_io_inputs, outputs=pp_save_msg)
+
+            with gr.Accordion('④ Optical 사전 히스토그램 학습/저장 (preset 모드용)', open=True):
+                gr.Markdown(
+                    'N장의 **Optical 이미지 폴더**로 히스토그램(CDF)을 미리 학습해 `.npy` 로 저장합니다. '
+                    '이후 **SAR 이미지만 있어도** histogram_mapping 모드를 `preset` 으로 두고 이 파일을 참조하면 '
+                    'SAR 히스토그램을 Optical 분포에 맞춥니다.')
+                with gr.Row():
+                    pp_tr_opt = gr.Textbox('./datasets/Optical/trainB', label='Optical 이미지 폴더 (학습용 N장)')
+                    pp_tr_save = gr.Textbox('./optical_hist.npy', label='저장 경로 (.npy)')
+                with gr.Row():
+                    pp_tr_bins = gr.Number(1024, label='bins', precision=0)
+                    pp_tr_max = gr.Number(0, label='사용 개수 (0=전체)', precision=0)
+                    pp_tr_btn = gr.Button('🧠 사전 히스토그램 학습/저장', variant='primary')
+                pp_tr_msg = gr.Textbox(label='결과', lines=4, interactive=False)
+                pp_tr_btn.click(pp_train_reference,
+                                inputs=[pp_tr_opt, pp_tr_save, pp_tr_bins, pp_tr_max],
+                                outputs=pp_tr_msg)
 
             with gr.Accordion('⑤ 미리보기 (Before / After)', open=True):
                 pp_prev_btn = gr.Button('🔍 첫 이미지 미리보기')
