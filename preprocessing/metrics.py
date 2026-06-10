@@ -16,6 +16,11 @@ ENL / speckle index are most meaningful on homogeneous regions; the global
 (whole-image) values used here are a practical dataset-level proxy.
 """
 
+import os
+import csv
+import json
+import datetime
+
 import numpy as np
 
 from preprocessing.pipeline import scan_images
@@ -57,16 +62,19 @@ def image_metrics(g):
             'enl': enl, 'avg_gradient': ag, 'entropy': entropy}
 
 
-def compute_dataset_metrics(image_dir, max_items=0, recursive=True):
+def compute_dataset_metrics(image_dir, max_items=0, recursive=True, save_dir=None):
     """Average the per-image metrics over all images under ``image_dir``.
 
-    Returns {'count', 'avg': {...}, 'std': {...}} or None if no images found.
+    Returns {'count', 'avg', 'std', 'per_image', 'saved'} or None if no images.
+    If ``save_dir`` is given, a per-image CSV + summary TXT/JSON log is written to
+    ``save_dir/metrics_logs/`` for later analysis.
     """
     files = scan_images(image_dir, recursive=recursive, shuffle=False,
                         seed=42, max_items=max_items)
     if not files:
         return None
     acc = {k: [] for k in METRIC_KEYS}
+    per_image = []
     n = 0
     for p in files:
         try:
@@ -76,12 +84,54 @@ def compute_dataset_metrics(image_dir, max_items=0, recursive=True):
         m = image_metrics(g)
         for k in METRIC_KEYS:
             acc[k].append(m[k])
+        per_image.append((os.path.basename(p), m))
         n += 1
     if n == 0:
         return None
     avg = {k: float(np.mean(acc[k])) for k in METRIC_KEYS}
     std = {k: float(np.std(acc[k])) for k in METRIC_KEYS}
-    return {'count': n, 'avg': avg, 'std': std}
+    result = {'count': n, 'avg': avg, 'std': std, 'per_image': per_image, 'saved': None}
+    if save_dir:
+        try:
+            result['saved'] = save_metrics_log(save_dir, result, image_dir)
+        except Exception:
+            result['saved'] = None
+    return result
+
+
+def save_metrics_log(save_dir, result, image_dir=''):
+    """Write per-image CSV + summary TXT/JSON under save_dir/metrics_logs/.
+
+    Returns the per-image CSV path.
+    """
+    log_dir = os.path.join(save_dir, 'metrics_logs')
+    os.makedirs(log_dir, exist_ok=True)
+    stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    csv_path = os.path.join(log_dir, f'metrics_{stamp}.csv')
+    txt_path = os.path.join(log_dir, f'metrics_{stamp}.txt')
+    json_path = os.path.join(log_dir, f'metrics_{stamp}.json')
+
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(['image'] + METRIC_KEYS)
+        for name, m in result.get('per_image', []):
+            w.writerow([name] + [round(m[k], 6) for k in METRIC_KEYS])
+        # average / std rows at the end for quick reading
+        w.writerow(['__AVG__'] + [round(result['avg'][k], 6) for k in METRIC_KEYS])
+        w.writerow(['__STD__'] + [round(result['std'][k], 6) for k in METRIC_KEYS])
+
+    with open(txt_path, 'w', encoding='utf-8') as f:
+        f.write(f'image_dir: {image_dir}\n')
+        f.write(format_metrics(result) + '\n')
+
+    try:
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump({'count': result['count'], 'avg': result['avg'],
+                       'std': result['std'], 'image_dir': image_dir},
+                      f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+    return csv_path
 
 
 def format_metrics(result):

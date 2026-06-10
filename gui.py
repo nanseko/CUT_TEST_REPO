@@ -84,6 +84,8 @@ CONFIG_KEYS = [
     # 5. Attention params
     'attention_type', 'attention_reduction',
     'attention_encoder', 'attention_resblocks', 'attention_decoder',
+    # HRNet params (only used when netG == hrnet)
+    'hrnet_branches', 'hrnet_modules', 'hrnet_blocks',
 ]
 
 DEFAULTS = {
@@ -128,6 +130,9 @@ DEFAULTS = {
     'attention_encoder': False,
     'attention_resblocks': False,
     'attention_decoder': False,
+    'hrnet_branches': 3,
+    'hrnet_modules': 3,
+    'hrnet_blocks': 2,
 }
 
 IMAGE_EXTS = ('*.png', '*.jpg', '*.jpeg', '*.bmp', '*.tif', '*.tiff')
@@ -309,6 +314,45 @@ def _resume_args(cfg):
     return [], '이어서 학습 요청됨 — 체크포인트를 찾지 못해 처음부터 학습합니다.'
 
 
+def recommended_nce_layers(netG, attention_type, attention_encoder, no_antialias, hrnet_branches):
+    """Pure-Python mirror of the generators' nce_default so the GUI can show the
+    correct PatchNCE tap indices for the current config (editable by the user)."""
+    if netG == 'hrnet':
+        return ','.join(str(i) for i in range(2 + int(hrnet_branches or 3)))
+    n_blocks = {'resnet_9blocks': 9, 'resnet_6blocks': 6, 'resnet_4blocks': 4}.get(netG, 9)
+    use_attn = str(attention_type) not in ('none', 'None', '', 'NONE')
+    n = [0]
+    taps = {}
+
+    def add():
+        i = n[0]
+        n[0] += 1
+        return i
+
+    taps['pixel'] = add()        # ReflectionPad2d(3)
+    add(); add(); add()          # conv7, norm, relu
+    if use_attn and _bool(attention_encoder):
+        add()                    # encoder attention after stem
+    for i in range(2):           # two downsampling stages
+        taps['enc%d' % i] = add()  # downsample conv (the tap)
+        add(); add()             # norm, relu
+        if not _bool(no_antialias):
+            add()                # Downsample
+        if use_attn and _bool(attention_encoder):
+            add()                # encoder attention
+    for b in range(n_blocks):
+        j = add()
+        if b == 0:
+            taps['res0'] = j
+        if b == min(4, n_blocks - 1):
+            taps['res4'] = j
+    return ','.join(str(taps[k]) for k in ('pixel', 'enc0', 'enc1', 'res0', 'res4'))
+
+
+def gui_recommend_nce(netG, attention_type, attention_encoder, no_antialias, hrnet_branches):
+    return recommended_nce_layers(netG, attention_type, attention_encoder, no_antialias, hrnet_branches)
+
+
 def build_train_cmd(cfg):
     cmd = [sys.executable, '-u', os.path.join(REPO_ROOT, 'train.py'),
            '--dataroot', str(cfg['dataroot']),
@@ -342,6 +386,10 @@ def build_train_cmd(cfg):
            '--lambda_lap', str(float(cfg.get('lambda_lap', 0.0))),
            '--lambda_color', str(float(cfg['lambda_color'])),
            '--display_id', '0']    # disable visdom; we stream the console log
+    if str(cfg['netG']) == 'hrnet':
+        cmd += ['--hrnet_branches', str(int(cfg.get('hrnet_branches', 3))),
+                '--hrnet_modules', str(int(cfg.get('hrnet_modules', 3))),
+                '--hrnet_blocks', str(int(cfg.get('hrnet_blocks', 2)))]
     if int(cfg.get('max_dataset_size', 0) or 0) > 0:
         # use only the first N files (sorted by name) from trainA/trainB
         cmd += ['--max_dataset_size', str(int(cfg['max_dataset_size']))]
@@ -376,6 +424,10 @@ def build_test_cmd(cfg, num_test, epoch):
            '--num_test', str(int(num_test)),
            '--epoch', str(epoch),
            '--phase', 'test']
+    if str(cfg['netG']) == 'hrnet':
+        cmd += ['--hrnet_branches', str(int(cfg.get('hrnet_branches', 3))),
+                '--hrnet_modules', str(int(cfg.get('hrnet_modules', 3))),
+                '--hrnet_blocks', str(int(cfg.get('hrnet_blocks', 2)))]
     cmd += _attention_args(cfg)
     return cmd
 
@@ -1091,15 +1143,23 @@ def pp_train_reference(optical_dir, save_path, bins, max_items):
 
 
 def pp_metrics(output_dir, max_items):
-    """SAR preprocessing quality metrics averaged over <output_dir>/images."""
+    """SAR preprocessing quality metrics averaged over <output_dir>/images.
+
+    A per-image CSV + summary log is written under <output_dir>/metrics_logs/.
+    """
     import preprocessing as PP
     img_dir = os.path.join(output_dir or '', 'images')
+    save_dir = output_dir or '.'
     if not os.path.isdir(img_dir):
         # allow pointing directly at a folder of images too
         img_dir = output_dir or ''
+        save_dir = output_dir or '.'
     try:
-        res = PP.compute_dataset_metrics(img_dir, max_items=int(max_items or 0))
-        return PP.format_metrics(res)
+        res = PP.compute_dataset_metrics(img_dir, max_items=int(max_items or 0), save_dir=save_dir)
+        out = PP.format_metrics(res)
+        if res and res.get('saved'):
+            out += f'\n\n📝 로그 저장: {os.path.abspath(res["saved"])}\n   (metrics_logs 폴더에 CSV/TXT/JSON)'
+        return out
     except Exception:
         return '지표 계산 오류:\n' + traceback.format_exc()
 
@@ -1394,8 +1454,27 @@ def build_ui():
                 comp['num_patches'] = gr.Number(cfg['num_patches'], label='num_patches', precision=0)
             with gr.Row():
                 comp['nce_T'] = gr.Number(cfg['nce_T'], label='nce_T (temperature)')
-                comp['nce_layers'] = gr.Textbox(cfg['nce_layers'], label='nce_layers (attention 시 자동 보정됨)')
                 comp['nce_idt'] = gr.Checkbox(bool(cfg['nce_idt']), label='nce_idt')
+            with gr.Row():
+                comp['nce_layers'] = gr.Textbox(
+                    cfg['nce_layers'],
+                    label='nce_layers (PatchNCE tap, 쉼표구분 · 직접 지정하면 그대로 사용)')
+                nce_reco_btn = gr.Button('🔢 현재 설정 권장값 계산')
+            gr.Markdown(
+                'ℹ️ PatchNCE tap은 직접 지정할 수 있습니다. netG/attention/no_antialias 설정을 바꾼 뒤 '
+                '**권장값 계산**을 누르면 현재 구조에 맞는 인덱스가 채워집니다(이후 자유롭게 편집). '
+                '비워두거나 기본값(0,4,8,12,16)이면 학습 시 자동 보정됩니다. '
+                'hrnet은 0 ~ (branches+1) 범위만 유효합니다.')
+            with gr.Accordion('HRNet 전용 옵션 (netG=hrnet일 때만 적용)', open=False):
+                with gr.Row():
+                    comp['hrnet_branches'] = gr.Number(cfg['hrnet_branches'], precision=0,
+                                                       label='branches (병렬 해상도 스트림 수, 2~4)')
+                    comp['hrnet_modules'] = gr.Number(cfg['hrnet_modules'], precision=0,
+                                                      label='modules (융합 모듈 수 = 깊이)')
+                    comp['hrnet_blocks'] = gr.Number(cfg['hrnet_blocks'], precision=0,
+                                                     label='blocks (브랜치당 residual 블록 수 = 폭)')
+                gr.Markdown('branches↑/modules↑/blocks↑ → 표현력·디테일↑, 메모리·시간↑. '
+                            'branches를 바꾸면 PatchNCE tap 수도 바뀌니 위 **권장값 계산**을 다시 누르세요.')
             with gr.Row():
                 comp['lambda_GAN'] = gr.Number(cfg['lambda_GAN'], label='lambda_GAN')
                 comp['lambda_NCE'] = gr.Number(cfg['lambda_NCE'], label='lambda_NCE')
@@ -1455,6 +1534,13 @@ def build_ui():
         save_basic.click(do_save, inputs=[cfg_path] + ordered_inputs, outputs=save_basic_out)
         save_cut.click(do_save, inputs=[cfg_path] + ordered_inputs, outputs=save_cut_out)
         save_att.click(do_save, inputs=[cfg_path] + ordered_inputs, outputs=save_att_out)
+
+        # fill nce_layers with the recommended taps for the current architecture
+        nce_reco_btn.click(
+            gui_recommend_nce,
+            inputs=[comp['netG'], comp['attention_type'], comp['attention_encoder'],
+                    comp['no_antialias'], comp['hrnet_branches']],
+            outputs=comp['nce_layers'])
 
         # Organize button (Tab 0) auto-fills the dataroot on completion.
         org_btn.click(organize_m4sar_to_cut,
