@@ -158,7 +158,10 @@ class BaseModel(ABC):
         errors_ret = OrderedDict()
         for name in self.loss_names:
             if isinstance(name, str):
-                errors_ret[name] = float(getattr(self, 'loss_' + name))  # float(...) works for both scalar tensor and float number
+                v = getattr(self, 'loss_' + name)
+                # detach grad tensors before float() to avoid the PyTorch warning
+                # "Converting a tensor with requires_grad=True to a scalar ..."
+                errors_ret[name] = float(v.detach()) if torch.is_tensor(v) else float(v)
         return errors_ret
 
     def save_networks(self, epoch):

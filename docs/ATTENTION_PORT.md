@@ -35,8 +35,24 @@ TF 포크가 PyTorch 포팅 파일(`pytorch/attention.py`, `pytorch/losses_extra
 --attention_resblocks                          (각 ResnetBlock residual 정제)
 --attention_decoder                            (각 upsampling 뒤에 삽입)
 --lambda_grad         0.0                       (real_A↔fake_B 구조/그래디언트 보존)
+--lambda_lap          0.0                       (real_A↔fake_B 고주파/라플라시안 보존, 블러↓)
+--grad_no_blur                                  (구조 손실에서 입력 블러 끔 → 더 날카로운 에지 타깃)
 --lambda_color        0.0                       (idt_B↔real_B 색 모멘트 일관성, nce_idt 필요)
+--netG hrnet                                    (고해상도 보존 생성기; 강반사체 주변 블러↓)
 ```
+
+### 강반사체 주변 블러를 줄이는 권장 조합
+
+ResNet 생성기는 1/4 해상도에서 처리해 강한 점산란체(reflector) 주변이 번질 수 있습니다.
+`hrnet` 은 풀해상도 스트림을 끝까지 유지(병렬 다해상도 + 융합)해 에지를 보존합니다.
+attention/CUT/PatchNCE 와 그대로 호환되며 `nce_layers` 는 자동 보정됩니다(`[0,1,2,3,4]`).
+
+```bash
+python train.py --dataroot ./datasets/M4-SAR-cut --name sar_hr --CUT_mode CUT \
+  --netG hrnet --attention_type coord --attention_resblocks \
+  --lambda_grad 1.0 --lambda_lap 0.5 --grad_no_blur
+```
+(너무 강하면 결과가 SAR처럼 밋밋/흐릿해질 수 있으니 λ로 조절. hrnet 은 ResNet보다 메모리를 더 씁니다.)
 
 ## 3. ⚠️ nce_layers 자동 보정 (가장 중요)
 

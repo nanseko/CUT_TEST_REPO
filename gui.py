@@ -75,11 +75,12 @@ CONFIG_KEYS = [
     # 3. Basic training params
     'CUT_mode', 'n_epochs', 'n_epochs_decay', 'batch_size', 'lr',
     'beta1', 'beta2', 'save_epoch_freq', 'load_size', 'crop_size', 'num_threads',
-    'continue_train',
+    'continue_train', 'max_dataset_size',
     # 4. CUT params
     'netG', 'normG', 'gan_mode', 'netF', 'netF_nc', 'num_patches', 'nce_T',
     'nce_layers', 'lambda_GAN', 'lambda_NCE', 'nce_idt',
-    'no_antialias', 'no_antialias_up', 'lambda_grad', 'lambda_color', 'serial_batches',
+    'no_antialias', 'no_antialias_up', 'lambda_grad', 'lambda_lap', 'grad_no_blur',
+    'lambda_color', 'serial_batches',
     # 5. Attention params
     'attention_type', 'attention_reduction',
     'attention_encoder', 'attention_resblocks', 'attention_decoder',
@@ -103,6 +104,7 @@ DEFAULTS = {
     'crop_size': 256,
     'num_threads': 4,
     'continue_train': False,
+    'max_dataset_size': 0,
     'netG': 'resnet_9blocks',
     'normG': 'instance',
     'gan_mode': 'lsgan',
@@ -117,6 +119,8 @@ DEFAULTS = {
     'no_antialias': False,
     'no_antialias_up': False,
     'lambda_grad': 0.0,
+    'lambda_lap': 0.0,
+    'grad_no_blur': False,
     'lambda_color': 0.0,
     'serial_batches': False,
     'attention_type': 'none',
@@ -335,8 +339,14 @@ def build_train_cmd(cfg):
            '--lambda_NCE', str(float(cfg['lambda_NCE'])),
            '--nce_idt', 'True' if _bool(cfg['nce_idt']) else 'False',
            '--lambda_grad', str(float(cfg['lambda_grad'])),
+           '--lambda_lap', str(float(cfg.get('lambda_lap', 0.0))),
            '--lambda_color', str(float(cfg['lambda_color'])),
            '--display_id', '0']    # disable visdom; we stream the console log
+    if int(cfg.get('max_dataset_size', 0) or 0) > 0:
+        # use only the first N files (sorted by name) from trainA/trainB
+        cmd += ['--max_dataset_size', str(int(cfg['max_dataset_size']))]
+    if _bool(cfg.get('grad_no_blur')):
+        cmd.append('--grad_no_blur')
     if _bool(cfg.get('serial_batches')):
         # pair real_A[i] with real_B[i] by sorted order (for aligned SAR/optical
         # sets); default CUT samples real_B randomly (unpaired, by design).
@@ -990,11 +1000,12 @@ def pp_apply(steps, sel, method, window, enl_auto, enl_val, damp, sig_auto, sig_
     return steps, _pp_rows(steps)
 
 
-def _pp_config_from_steps(input_dir, output_dir, max_items, recursive, shuffle, steps):
+def _pp_config_from_steps(input_dir, output_dir, max_items, recursive, shuffle, steps, num_workers=1):
     return {
         'io': {'input_dir': input_dir, 'output_dir': output_dir,
                'max_items': int(max_items or 0), 'recursive': bool(recursive),
-               'shuffle': bool(shuffle), 'seed': 42, 'save_format': 'png'},
+               'shuffle': bool(shuffle), 'seed': 42, 'save_format': 'png',
+               'num_workers': max(1, int(num_workers or 1))},
         'pipeline': {'steps': [{'name': s['name'], 'enabled': s.get('enabled', True),
                                 'params': s['params']} for s in steps]},
     }
@@ -1013,10 +1024,10 @@ def pp_load_settings():
     return {}
 
 
-def pp_save_settings(steps, input_dir, output_dir, max_items, recursive, shuffle):
+def pp_save_settings(steps, input_dir, output_dir, max_items, recursive, shuffle, num_workers=1):
     data = {'input_dir': input_dir, 'output_dir': output_dir,
             'max_items': int(max_items or 0), 'recursive': bool(recursive),
-            'shuffle': bool(shuffle), 'steps': steps}
+            'shuffle': bool(shuffle), 'num_workers': max(1, int(num_workers or 1)), 'steps': steps}
     try:
         with open(PP_CONFIG_PATH, 'w') as f:
             json.dump(data, f, indent=2, default=str)
@@ -1024,17 +1035,17 @@ def pp_save_settings(steps, input_dir, output_dir, max_items, recursive, shuffle
         pass
 
 
-def pp_save_btn_fn(steps, input_dir, output_dir, max_items, recursive, shuffle):
-    pp_save_settings(steps, input_dir, output_dir, max_items, recursive, shuffle)
+def pp_save_btn_fn(steps, input_dir, output_dir, max_items, recursive, shuffle, num_workers):
+    pp_save_settings(steps, input_dir, output_dir, max_items, recursive, shuffle, num_workers)
     return f'✅ 전처리 설정 저장됨: {PP_CONFIG_PATH} ({datetime.datetime.now().strftime("%H:%M:%S")})'
 
 
-def pp_preview(steps, input_dir, output_dir, max_items, recursive, shuffle):
+def pp_preview(steps, input_dir, output_dir, max_items, recursive, shuffle, num_workers):
     import preprocessing as PP
-    pp_save_settings(steps, input_dir, output_dir, max_items, recursive, shuffle)
+    pp_save_settings(steps, input_dir, output_dir, max_items, recursive, shuffle, num_workers)
     if not steps:
         return None, None, '파이프라인에 스텝이 없습니다. 스텝을 추가하세요.'
-    cfg = _pp_config_from_steps(input_dir, output_dir, max_items, recursive, shuffle, steps)
+    cfg = _pp_config_from_steps(input_dir, output_dir, max_items, recursive, shuffle, steps, num_workers)
     files = PP.scan_images(input_dir, bool(recursive), False, 42, 1)
     if not files:
         return None, None, '입력 폴더에 이미지가 없습니다.'
@@ -1045,18 +1056,32 @@ def pp_preview(steps, input_dir, output_dir, max_items, recursive, shuffle):
         return None, None, '미리보기 오류:\n' + traceback.format_exc()
 
 
-def pp_run(steps, input_dir, output_dir, max_items, recursive, shuffle):
+def pp_run(steps, input_dir, output_dir, max_items, recursive, shuffle, num_workers):
     import preprocessing as PP
-    pp_save_settings(steps, input_dir, output_dir, max_items, recursive, shuffle)
+    pp_save_settings(steps, input_dir, output_dir, max_items, recursive, shuffle, num_workers)
     if not steps:
         yield '파이프라인에 스텝이 없습니다.', []
         return
-    cfg = _pp_config_from_steps(input_dir, output_dir, max_items, recursive, shuffle, steps)
+    cfg = _pp_config_from_steps(input_dir, output_dir, max_items, recursive, shuffle, steps, num_workers)
     try:
         for log, prev in PP.run_pipeline(cfg):
             yield log, prev
     except Exception:
         yield ('전처리 중 예외:\n' + traceback.format_exc(), [])
+
+
+def pp_metrics(output_dir, max_items):
+    """SAR preprocessing quality metrics averaged over <output_dir>/images."""
+    import preprocessing as PP
+    img_dir = os.path.join(output_dir or '', 'images')
+    if not os.path.isdir(img_dir):
+        # allow pointing directly at a folder of images too
+        img_dir = output_dir or ''
+    try:
+        res = PP.compute_dataset_metrics(img_dir, max_items=int(max_items or 0))
+        return PP.format_metrics(res)
+    except Exception:
+        return '지표 계산 오류:\n' + traceback.format_exc()
 
 
 def pp_export(output_dir, optical_dir, out_root, test_ratio, link_mode):
@@ -1163,6 +1188,8 @@ def build_ui():
                     pp_max = gr.Number(_pps.get('max_items', 20), label='처리 개수 (0=전체)', precision=0)
                     pp_recursive = gr.Checkbox(_pps.get('recursive', True), label='하위 폴더 포함')
                     pp_shuffle = gr.Checkbox(_pps.get('shuffle', False), label='섞기(shuffle)')
+                    pp_workers = gr.Number(_pps.get('num_workers', 1),
+                                           label='병렬 처리 수 num_workers (1=순차, CPU 코어수 권장)', precision=0)
                 with gr.Row():
                     pp_save_btn = gr.Button('💾 전처리 설정 저장 (폴더/순서 보존)')
                     pp_save_msg = gr.Textbox(label='', interactive=False)
@@ -1242,7 +1269,7 @@ def build_ui():
             pp_apply_btn.click(pp_apply, inputs=[pp_steps, pp_sel] + edit_widgets,
                                outputs=[pp_steps, pp_table])
 
-            pp_io_inputs = [pp_steps, pp_in, pp_out, pp_max, pp_recursive, pp_shuffle]
+            pp_io_inputs = [pp_steps, pp_in, pp_out, pp_max, pp_recursive, pp_shuffle, pp_workers]
             pp_save_btn.click(pp_save_btn_fn, inputs=pp_io_inputs, outputs=pp_save_msg)
 
             with gr.Accordion('⑤ 미리보기 (Before / After)', open=True):
@@ -1273,6 +1300,17 @@ def build_ui():
                                  inputs=[pp_out, pp_exp_opt, pp_exp_root, pp_exp_ratio, pp_exp_link],
                                  outputs=pp_exp_msg)
 
+            with gr.Accordion('⑦ 전처리 성능 지표 (output 평균)', open=True):
+                gr.Markdown(
+                    '위 **① 출력 폴더**의 `images/` 에 대해 SAR 전처리 품질 지표를 이미지 평균으로 계산합니다.\n'
+                    '- **Speckle Index(σ/μ)**: 낮을수록 스페클↓ · **ENL((μ/σ)²)**: 높을수록 스페클 억제↑\n'
+                    '- **Avg Gradient(선명도)** / **Entropy(정보량)**: 높을수록 디테일 유지 · **Mean/Std**: 밝기/대비')
+                with gr.Row():
+                    pp_met_max = gr.Number(0, label='평가 개수 (0=전체)', precision=0)
+                    pp_met_btn = gr.Button('📊 성능 지표 계산', variant='primary')
+                pp_met_out = gr.Textbox(label='성능 지표 결과', lines=10, interactive=False)
+                pp_met_btn.click(pp_metrics, inputs=[pp_out, pp_met_max], outputs=pp_met_out)
+
         # ---- Tab 3 : Basic training params ----------------------------- #
         with gr.Tab('3. 기본 학습 파라미터'):
             with gr.Row():
@@ -1290,6 +1328,9 @@ def build_ui():
             with gr.Row():
                 comp['load_size'] = gr.Number(cfg['load_size'], label='load_size', precision=0)
                 comp['crop_size'] = gr.Number(cfg['crop_size'], label='crop_size', precision=0)
+                comp['max_dataset_size'] = gr.Number(
+                    cfg['max_dataset_size'], precision=0,
+                    label='학습 사용 개수 max_dataset_size (0=전체, 예: 2000/5000)')
             comp['continue_train'] = gr.Checkbox(
                 bool(cfg['continue_train']),
                 label='이어서 학습 (continue_train) — 마지막 저장된 epoch 체크포인트에서 재개')
@@ -1303,8 +1344,9 @@ def build_ui():
         # ---- Tab 4 : CUT params ---------------------------------------- #
         with gr.Tab('4. CUT 파라미터'):
             with gr.Row():
-                comp['netG'] = gr.Dropdown(['resnet_9blocks', 'resnet_6blocks', 'resnet_4blocks'],
-                                           value=cfg['netG'], label='netG')
+                comp['netG'] = gr.Dropdown(['resnet_9blocks', 'resnet_6blocks', 'resnet_4blocks', 'hrnet'],
+                                           value=cfg['netG'],
+                                           label='netG (hrnet = 고해상도 보존, 강반사체 블러↓)')
                 comp['normG'] = gr.Dropdown(['instance', 'batch', 'none'], value=cfg['normG'], label='normG')
                 comp['gan_mode'] = gr.Dropdown(['lsgan', 'nonsaturating', 'vanilla'], value=cfg['gan_mode'], label='gan_mode')
             with gr.Row():
@@ -1319,8 +1361,15 @@ def build_ui():
                 comp['lambda_GAN'] = gr.Number(cfg['lambda_GAN'], label='lambda_GAN')
                 comp['lambda_NCE'] = gr.Number(cfg['lambda_NCE'], label='lambda_NCE')
             with gr.Row():
-                comp['lambda_grad'] = gr.Number(cfg['lambda_grad'], label='lambda_grad (구조 보존)')
+                comp['lambda_grad'] = gr.Number(cfg['lambda_grad'], label='lambda_grad (구조/에지 보존)')
+                comp['lambda_lap'] = gr.Number(cfg['lambda_lap'], label='lambda_lap (고주파/라플라시안, 블러↓)')
                 comp['lambda_color'] = gr.Number(cfg['lambda_color'], label='lambda_color (색 일관성, nce_idt 필요)')
+            comp['grad_no_blur'] = gr.Checkbox(
+                bool(cfg['grad_no_blur']),
+                label='grad_no_blur (구조 손실에서 입력 블러 끔 → 더 날카로운 에지 타깃)')
+            gr.Markdown(
+                'ℹ️ 강반사체 주변 블러가 심하면: `netG=hrnet` + `lambda_grad`(예 1.0) + `lambda_lap`(예 0.5) + '
+                '`grad_no_blur` 체크를 함께 써보세요. 너무 강하면 결과가 SAR처럼 밋밋해질 수 있으니 값으로 조절하세요.')
             with gr.Row():
                 comp['no_antialias'] = gr.Checkbox(bool(cfg['no_antialias']), label='no_antialias (다운샘플 stride2)')
                 comp['no_antialias_up'] = gr.Checkbox(bool(cfg['no_antialias_up']), label='no_antialias_up')
