@@ -75,7 +75,7 @@ CONFIG_KEYS = [
     # 3. Basic training params
     'CUT_mode', 'n_epochs', 'n_epochs_decay', 'batch_size', 'lr',
     'beta1', 'beta2', 'save_epoch_freq', 'load_size', 'crop_size', 'num_threads',
-    'continue_train',
+    'continue_train', 'max_dataset_size',
     # 4. CUT params
     'netG', 'normG', 'gan_mode', 'netF', 'netF_nc', 'num_patches', 'nce_T',
     'nce_layers', 'lambda_GAN', 'lambda_NCE', 'nce_idt',
@@ -104,6 +104,7 @@ DEFAULTS = {
     'crop_size': 256,
     'num_threads': 4,
     'continue_train': False,
+    'max_dataset_size': 0,
     'netG': 'resnet_9blocks',
     'normG': 'instance',
     'gan_mode': 'lsgan',
@@ -341,6 +342,9 @@ def build_train_cmd(cfg):
            '--lambda_lap', str(float(cfg.get('lambda_lap', 0.0))),
            '--lambda_color', str(float(cfg['lambda_color'])),
            '--display_id', '0']    # disable visdom; we stream the console log
+    if int(cfg.get('max_dataset_size', 0) or 0) > 0:
+        # use only the first N files (sorted by name) from trainA/trainB
+        cmd += ['--max_dataset_size', str(int(cfg['max_dataset_size']))]
     if _bool(cfg.get('grad_no_blur')):
         cmd.append('--grad_no_blur')
     if _bool(cfg.get('serial_batches')):
@@ -1066,6 +1070,20 @@ def pp_run(steps, input_dir, output_dir, max_items, recursive, shuffle, num_work
         yield ('전처리 중 예외:\n' + traceback.format_exc(), [])
 
 
+def pp_metrics(output_dir, max_items):
+    """SAR preprocessing quality metrics averaged over <output_dir>/images."""
+    import preprocessing as PP
+    img_dir = os.path.join(output_dir or '', 'images')
+    if not os.path.isdir(img_dir):
+        # allow pointing directly at a folder of images too
+        img_dir = output_dir or ''
+    try:
+        res = PP.compute_dataset_metrics(img_dir, max_items=int(max_items or 0))
+        return PP.format_metrics(res)
+    except Exception:
+        return '지표 계산 오류:\n' + traceback.format_exc()
+
+
 def pp_export(output_dir, optical_dir, out_root, test_ratio, link_mode):
     import preprocessing as PP
     sar_dir = os.path.join(output_dir, 'images')
@@ -1282,6 +1300,17 @@ def build_ui():
                                  inputs=[pp_out, pp_exp_opt, pp_exp_root, pp_exp_ratio, pp_exp_link],
                                  outputs=pp_exp_msg)
 
+            with gr.Accordion('⑦ 전처리 성능 지표 (output 평균)', open=True):
+                gr.Markdown(
+                    '위 **① 출력 폴더**의 `images/` 에 대해 SAR 전처리 품질 지표를 이미지 평균으로 계산합니다.\n'
+                    '- **Speckle Index(σ/μ)**: 낮을수록 스페클↓ · **ENL((μ/σ)²)**: 높을수록 스페클 억제↑\n'
+                    '- **Avg Gradient(선명도)** / **Entropy(정보량)**: 높을수록 디테일 유지 · **Mean/Std**: 밝기/대비')
+                with gr.Row():
+                    pp_met_max = gr.Number(0, label='평가 개수 (0=전체)', precision=0)
+                    pp_met_btn = gr.Button('📊 성능 지표 계산', variant='primary')
+                pp_met_out = gr.Textbox(label='성능 지표 결과', lines=10, interactive=False)
+                pp_met_btn.click(pp_metrics, inputs=[pp_out, pp_met_max], outputs=pp_met_out)
+
         # ---- Tab 3 : Basic training params ----------------------------- #
         with gr.Tab('3. 기본 학습 파라미터'):
             with gr.Row():
@@ -1299,6 +1328,9 @@ def build_ui():
             with gr.Row():
                 comp['load_size'] = gr.Number(cfg['load_size'], label='load_size', precision=0)
                 comp['crop_size'] = gr.Number(cfg['crop_size'], label='crop_size', precision=0)
+                comp['max_dataset_size'] = gr.Number(
+                    cfg['max_dataset_size'], precision=0,
+                    label='학습 사용 개수 max_dataset_size (0=전체, 예: 2000/5000)')
             comp['continue_train'] = gr.Checkbox(
                 bool(cfg['continue_train']),
                 label='이어서 학습 (continue_train) — 마지막 저장된 epoch 체크포인트에서 재개')
