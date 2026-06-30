@@ -113,9 +113,19 @@ class CUTModel(BaseModel):
                          attention_on, getattr(opt, 'no_antialias', False)))
             self.nce_layers = list(gen.nce_default)
         elif user_set_nce and (attention_on or getattr(opt, 'netG', '') == 'hrnet'):
-            print('[CUT] 경고: attention/hrnet 사용 중 사용자 지정 --nce_layers=%s 는 '
-                  'tap 위치와 어긋날 수 있습니다. 기본값으로 두면 자동 보정됩니다 (권장 %s).'
+            print('[CUT] 사용자 지정 --nce_layers=%s 사용 (자동 보정 안 함). 권장값: %s'
                   % (self.opt.nce_layers, list(getattr(gen, 'nce_default', []))))
+
+        # HRNet only exposes a small set of tap points (0..n_taps-1); drop any
+        # out-of-range indices the user may have entered so forward() can't fail.
+        if getattr(opt, 'netG', '') == 'hrnet' and hasattr(gen, 'n_taps'):
+            valid = [i for i in self.nce_layers if 0 <= i < gen.n_taps]
+            if valid != self.nce_layers:
+                print('[CUT] hrnet: nce_layers %s -> 사용 가능한 %s 만 사용 (0~%d)'
+                      % (self.nce_layers, valid, gen.n_taps - 1))
+                self.nce_layers = valid or list(gen.nce_default)
+
+        print('[CUT] PatchNCE nce_layers = %s' % self.nce_layers)
 
         if self.isTrain:
             self.netD = networks.define_D(opt.output_nc, opt.ndf, opt.netD, opt.n_layers_D, opt.normD, opt.init_type, opt.init_gain, opt.no_antialias, self.gpu_ids, opt)

@@ -263,7 +263,10 @@ def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, in
     elif netG == 'resnet_4blocks':
         net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, no_antialias=no_antialias, no_antialias_up=no_antialias_up, n_blocks=4, opt=opt, **attn_kwargs)
     elif netG == 'hrnet':
-        net = HRNetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, opt=opt, **attn_kwargs)
+        net = HRNetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, opt=opt,
+                             n_branches=getattr(opt, 'hrnet_branches', 3),
+                             n_modules=getattr(opt, 'hrnet_modules', 3),
+                             n_blocks=getattr(opt, 'hrnet_blocks', 2), **attn_kwargs)
     elif netG == 'unet_128':
         net = UnetGenerator(input_nc, output_nc, 7, ngf, norm_layer=norm_layer, use_dropout=use_dropout)
     elif netG == 'unet_256':
@@ -1178,8 +1181,9 @@ class HRNetGenerator(nn.Module):
 
         self.n_branches = n_branches
         self.n_modules = n_modules
-        # PatchNCE taps: 0=pixels, 1=stem(HR), 2/3/4 = HR/mid/low after first module
-        self.nce_default = [0, 1, 2, 3, 4]
+        # PatchNCE taps: 0=pixels, 1=stem(HR), then one per branch after module 0.
+        self.n_taps = 2 + n_branches
+        self.nce_default = list(range(self.n_taps))
 
     def _fuse_to_hr(self, xs):
         size = xs[0].shape[-2:]

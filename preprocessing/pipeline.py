@@ -78,6 +78,41 @@ def build_optical_reference_cdf(optical_dir, bins=1024, max_items=200, seed=42):
     return x, cdf
 
 
+def save_reference_cdf(optical_dir, save_path, bins=1024, max_items=0):
+    """Pre-train: build the optical luminance CDF from N optical images and save
+    it to a .npy file (shape (2, bins) = [x; cdf]) for later 'preset' mapping.
+
+    max_items=0 uses all images in the folder. Returns (save_path, bins).
+    """
+    res = build_optical_reference_cdf(optical_dir, bins=int(bins),
+                                      max_items=int(max_items or 0))
+    if res is None:
+        raise ValueError(f'optical 이미지를 찾지 못했습니다: {optical_dir}')
+    x, cdf = res
+    if not save_path.lower().endswith('.npy'):
+        save_path = save_path + '.npy'
+    os.makedirs(os.path.dirname(os.path.abspath(save_path)) or '.', exist_ok=True)
+    np.save(save_path, np.stack([x, cdf], axis=0).astype(np.float64))
+    return save_path, len(cdf)
+
+
+def load_reference_cdf(path):
+    """Load a pre-trained CDF saved by save_reference_cdf. Returns (x, cdf) or None."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        arr = np.load(path)
+    except Exception:
+        return None
+    arr = np.asarray(arr, dtype=np.float64)
+    if arr.ndim == 2 and arr.shape[0] >= 2:
+        return arr[0], arr[1]
+    cdf = arr.ravel()
+    if cdf.size == 0:
+        return None
+    return np.linspace(0, 1, len(cdf)), cdf
+
+
 # --------------------------------------------------------------------------- #
 # Config / presets
 # --------------------------------------------------------------------------- #
@@ -220,7 +255,7 @@ def run_pipeline(config, max_preview=12):
         line = f'[{datetime.datetime.now().strftime("%H:%M:%S")}] {msg}'
         logs.append(line)
         try:
-            with open(log_path, 'a') as f:
+            with open(log_path, 'a', encoding='utf-8') as f:
                 f.write(line + '\n')
         except Exception:
             pass
@@ -239,34 +274,57 @@ def run_pipeline(config, max_preview=12):
     enabled_names = [s.name for s in steps if s.enabled]
     yield log('pipeline: ' + ' -> '.join(enabled_names)), previews
 
-    # Optical reference CDF (once) if needed
+    # Optical reference CDF (once) if needed. Two sources:
+    #   mode 'unpaired_optical_reference' -> build from an optical folder now
+    #   mode 'preset'                     -> load a pre-trained .npy CDF file
     optical_target = None
     for s in steps:
-        if s.name == 'histogram_mapping' and s.enabled and \
-                s.params.get('mode') == 'unpaired_optical_reference':
-            ref = s.params.get('optical_reference_dir')
-            yield log(f'optical reference CDF 생성 중: {ref}'), previews
-            try:
-                optical_target = build_optical_reference_cdf(
-                    ref, int(s.params.get('bins', 1024)))
-            except Exception:
-                optical_target = None
-                yield log('경고: optical reference CDF 생성 실패 -> sar_only로 대체\n'
-                          + traceback.format_exc().splitlines()[-1]), previews
+        if s.name != 'histogram_mapping' or not s.enabled:
+            continue
+        mode = s.params.get('mode')
+        try:
+            if mode == 'unpaired_optical_reference':
+                ref = s.params.get('optical_reference_dir')
+                yield log(f'optical reference CDF 생성 중(폴더): {ref}'), previews
+                optical_target = build_optical_reference_cdf(ref, int(s.params.get('bins', 1024)))
+            elif mode == 'preset':
+                ref = s.params.get('reference_cdf_path')
+                yield log(f'사전 학습된 히스토그램(.npy) 불러오는 중: {ref}'), previews
+                optical_target = load_reference_cdf(ref)
+        except Exception:
+            optical_target = None
+            yield log('경고: 히스토그램 reference 처리 실패 -> sar_only로 대체\n'
+                      + traceback.format_exc().splitlines()[-1]), previews
+        if mode in ('unpaired_optical_reference', 'preset'):
             if optical_target is None:
                 yield log('경고: optical reference를 찾지 못해 sar_only(optical_like_v1)로 대체'), previews
             else:
-                yield log(f'optical reference CDF 생성 완료 (bins={len(optical_target[0])})'), previews
+                yield log(f'optical reference CDF 준비 완료 (bins={len(optical_target[0])})'), previews
 
-    # manifest
-    mf = open(manifest_path, 'w', newline='')
-    writer = csv.writer(mf)
+    # manifest — opened defensively so a locked/again-open file (e.g. the CSV is
+    # open in Excel on Windows) or an encoding issue can never stop processing.
+    mf = None
+    try:
+        mf = open(manifest_path, 'w', newline='', encoding='utf-8')
+    except Exception:
+        # fall back to a timestamped file if the default is locked
+        try:
+            manifest_path = os.path.join(out_dir, f'manifest_{stamp}.csv')
+            mf = open(manifest_path, 'w', newline='', encoding='utf-8')
+        except Exception:
+            mf = None
+    writer = csv.writer(mf) if mf is not None else None
 
     def wrow(row):
-        # flush after every row so manifest.csv is never empty/stale even if the
-        # run is interrupted (the UI generator may be stopped mid-way)
-        writer.writerow(row)
-        mf.flush()
+        # never let a manifest write error stop the run (Windows file locks,
+        # cp949 encoding, etc.); the streamed log is the primary record anyway.
+        if writer is None:
+            return
+        try:
+            writer.writerow(row)
+            mf.flush()
+        except Exception:
+            pass
 
     header_row = ['input_path', 'output_path', 'status', 'error',
                   'orig_h', 'orig_w', 'out_h', 'out_w', 'steps',
@@ -313,10 +371,11 @@ def run_pipeline(config, max_preview=12):
                     done = ok + skip + fail
                     if done % step == 0 or done == n:
                         yield log(f'완료 {done}/{n} (성공 {ok} / 건너뜀 {skip} / 실패 {fail})'), previews[-max_preview:]
-            mf.close()
+            if mf is not None:
+                mf.close()
             try:
-                with open(os.path.join(out_dir, 'pipeline_config.resolved.json'), 'w') as f:
-                    json.dump(config, f, indent=2, default=str)
+                with open(os.path.join(out_dir, 'pipeline_config.resolved.json'), 'w', encoding='utf-8') as f:
+                    json.dump(config, f, indent=2, default=str, ensure_ascii=False)
             except Exception:
                 pass
             yield log(f'완료(병렬): 성공 {ok}, 건너뜀 {skip}, 실패 {fail} -> {img_dir}\n'
@@ -411,11 +470,12 @@ def run_pipeline(config, max_preview=12):
                       f'({round(time.time() - t0, 2)}s)  '
                       f'(성공 {ok} / 건너뜀 {skip} / 실패 {fail})'), previews[-max_preview:]
 
-    mf.close()
+    if mf is not None:
+        mf.close()
     # resolved config
     try:
-        with open(os.path.join(out_dir, 'pipeline_config.resolved.json'), 'w') as f:
-            json.dump(config, f, indent=2, default=str)
+        with open(os.path.join(out_dir, 'pipeline_config.resolved.json'), 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2, default=str, ensure_ascii=False)
     except Exception:
         pass
     yield log(f'완료: 성공 {ok}, 건너뜀 {skip}, 실패 {fail} -> {img_dir}\n'

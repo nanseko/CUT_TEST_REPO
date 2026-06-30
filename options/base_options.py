@@ -56,6 +56,13 @@ class BaseOptions():
                             help='refine each ResnetBlock residual branch with attention')
         parser.add_argument('--attention_decoder', action='store_true',
                             help='insert attention after each upsampling stage of G')
+        # HRNet generator parameters (only used when --netG hrnet)
+        parser.add_argument('--hrnet_branches', type=int, default=3,
+                            help='HRNet: number of parallel resolution branches (e.g. 2-4)')
+        parser.add_argument('--hrnet_modules', type=int, default=3,
+                            help='HRNet: number of multi-resolution fusion modules (depth)')
+        parser.add_argument('--hrnet_blocks', type=int, default=2,
+                            help='HRNet: residual blocks per branch per module (width)')
         # dataset parameters
         parser.add_argument('--dataset_mode', type=str, default='unaligned', help='chooses how datasets are loaded. [unaligned | aligned | single | colorization]')
         parser.add_argument('--direction', type=str, default='AtoB', help='AtoB or BtoA')

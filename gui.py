@@ -84,6 +84,8 @@ CONFIG_KEYS = [
     # 5. Attention params
     'attention_type', 'attention_reduction',
     'attention_encoder', 'attention_resblocks', 'attention_decoder',
+    # HRNet params (only used when netG == hrnet)
+    'hrnet_branches', 'hrnet_modules', 'hrnet_blocks',
 ]
 
 DEFAULTS = {
@@ -128,6 +130,9 @@ DEFAULTS = {
     'attention_encoder': False,
     'attention_resblocks': False,
     'attention_decoder': False,
+    'hrnet_branches': 3,
+    'hrnet_modules': 3,
+    'hrnet_blocks': 2,
 }
 
 IMAGE_EXTS = ('*.png', '*.jpg', '*.jpeg', '*.bmp', '*.tif', '*.tiff')
@@ -309,6 +314,45 @@ def _resume_args(cfg):
     return [], '이어서 학습 요청됨 — 체크포인트를 찾지 못해 처음부터 학습합니다.'
 
 
+def recommended_nce_layers(netG, attention_type, attention_encoder, no_antialias, hrnet_branches):
+    """Pure-Python mirror of the generators' nce_default so the GUI can show the
+    correct PatchNCE tap indices for the current config (editable by the user)."""
+    if netG == 'hrnet':
+        return ','.join(str(i) for i in range(2 + int(hrnet_branches or 3)))
+    n_blocks = {'resnet_9blocks': 9, 'resnet_6blocks': 6, 'resnet_4blocks': 4}.get(netG, 9)
+    use_attn = str(attention_type) not in ('none', 'None', '', 'NONE')
+    n = [0]
+    taps = {}
+
+    def add():
+        i = n[0]
+        n[0] += 1
+        return i
+
+    taps['pixel'] = add()        # ReflectionPad2d(3)
+    add(); add(); add()          # conv7, norm, relu
+    if use_attn and _bool(attention_encoder):
+        add()                    # encoder attention after stem
+    for i in range(2):           # two downsampling stages
+        taps['enc%d' % i] = add()  # downsample conv (the tap)
+        add(); add()             # norm, relu
+        if not _bool(no_antialias):
+            add()                # Downsample
+        if use_attn and _bool(attention_encoder):
+            add()                # encoder attention
+    for b in range(n_blocks):
+        j = add()
+        if b == 0:
+            taps['res0'] = j
+        if b == min(4, n_blocks - 1):
+            taps['res4'] = j
+    return ','.join(str(taps[k]) for k in ('pixel', 'enc0', 'enc1', 'res0', 'res4'))
+
+
+def gui_recommend_nce(netG, attention_type, attention_encoder, no_antialias, hrnet_branches):
+    return recommended_nce_layers(netG, attention_type, attention_encoder, no_antialias, hrnet_branches)
+
+
 def build_train_cmd(cfg):
     cmd = [sys.executable, '-u', os.path.join(REPO_ROOT, 'train.py'),
            '--dataroot', str(cfg['dataroot']),
@@ -342,6 +386,10 @@ def build_train_cmd(cfg):
            '--lambda_lap', str(float(cfg.get('lambda_lap', 0.0))),
            '--lambda_color', str(float(cfg['lambda_color'])),
            '--display_id', '0']    # disable visdom; we stream the console log
+    if str(cfg['netG']) == 'hrnet':
+        cmd += ['--hrnet_branches', str(int(cfg.get('hrnet_branches', 3))),
+                '--hrnet_modules', str(int(cfg.get('hrnet_modules', 3))),
+                '--hrnet_blocks', str(int(cfg.get('hrnet_blocks', 2)))]
     if int(cfg.get('max_dataset_size', 0) or 0) > 0:
         # use only the first N files (sorted by name) from trainA/trainB
         cmd += ['--max_dataset_size', str(int(cfg['max_dataset_size']))]
@@ -376,6 +424,10 @@ def build_test_cmd(cfg, num_test, epoch):
            '--num_test', str(int(num_test)),
            '--epoch', str(epoch),
            '--phase', 'test']
+    if str(cfg['netG']) == 'hrnet':
+        cmd += ['--hrnet_branches', str(int(cfg.get('hrnet_branches', 3))),
+                '--hrnet_modules', str(int(cfg.get('hrnet_modules', 3))),
+                '--hrnet_blocks', str(int(cfg.get('hrnet_blocks', 2)))]
     cmd += _attention_args(cfg)
     return cmd
 
@@ -829,6 +881,7 @@ def _default_step(category):
     if category == 'histogram':
         return {'name': 'histogram_mapping', 'enabled': True,
                 'params': {'mode': 'sar_only', 'bins': 1024, 'optical_reference_dir': None,
+                           'reference_cdf_path': None,
                            'clahe': {'enabled': False, 'clip_limit': 2.0, 'tile_grid_size': [8, 8]}},
                 'label': 'histogram: sar_only'}
     if category == 'resize':
@@ -898,7 +951,7 @@ def pp_on_select(steps, evt: gr.SelectData):
     except Exception:
         row = 0
     if not steps or row >= len(steps):
-        return [gr.update()] * 26
+        return [gr.update()] * 27
     s = steps[row]
     name = s['name']
     p = s.get('params', {})
@@ -919,6 +972,7 @@ def pp_on_select(steps, evt: gr.SelectData):
     histmode = p.get('mode', 'sar_only') if name == 'histogram_mapping' else 'sar_only'
     bins = int(p.get('bins', 1024))
     optref = p.get('optical_reference_dir') or ''
+    refcdf = p.get('reference_cdf_path') or ''
     clahe = bool((p.get('clahe', {}) or {}).get('enabled', False))
     size = int(p.get('image_size', 256))
     ch = int(p.get('output_channels', 3))
@@ -964,11 +1018,12 @@ def pp_on_select(steps, evt: gr.SelectData):
         gr.update(value=clahe),
         gr.update(value=size),
         gr.update(value=ch),
+        gr.update(value=refcdf),
     ]
 
 
 def pp_apply(steps, sel, method, window, enl_auto, enl_val, damp, sig_auto, sig_val,
-             intmode, cmin, cmax, ign, histmode, bins, optref, clahe, size, ch):
+             intmode, cmin, cmax, ign, histmode, bins, optref, clahe, size, ch, refcdf):
     steps = list(steps)
     i = int(sel)
     if not (0 <= i < len(steps)):
@@ -988,6 +1043,7 @@ def pp_apply(steps, sel, method, window, enl_auto, enl_val, damp, sig_auto, sig_
     elif name == 'histogram_mapping':
         steps[i]['params'] = {'mode': histmode, 'bins': int(bins),
                               'optical_reference_dir': (optref or None),
+                              'reference_cdf_path': (refcdf or None),
                               'clahe': {'enabled': bool(clahe), 'clip_limit': 2.0,
                                         'tile_grid_size': [8, 8]}}
         steps[i]['label'] = f'histogram: {histmode}'
@@ -1057,29 +1113,75 @@ def pp_preview(steps, input_dir, output_dir, max_items, recursive, shuffle, num_
 
 
 def pp_run(steps, input_dir, output_dir, max_items, recursive, shuffle, num_workers):
+    # Feed the gallery in-memory numpy arrays (not file paths). Returning a local
+    # file path to a gr.Gallery can raise in Gradio's output postprocess when the
+    # file is outside the allowed paths — that exception fires OUTSIDE this
+    # function, killing the stream right after the first preview appears (the
+    # "1장만 처리되고 오류" symptom). Numpy arrays are encoded by Gradio itself,
+    # so there is no path validation and it works on every platform/version.
+    import numpy as np
+    from PIL import Image
     import preprocessing as PP
-    pp_save_settings(steps, input_dir, output_dir, max_items, recursive, shuffle, num_workers)
-    if not steps:
-        yield '파이프라인에 스텝이 없습니다.', []
-        return
-    cfg = _pp_config_from_steps(input_dir, output_dir, max_items, recursive, shuffle, steps, num_workers)
     try:
+        pp_save_settings(steps, input_dir, output_dir, max_items, recursive, shuffle, num_workers)
+        if not steps:
+            yield '파이프라인에 스텝이 없습니다.', []
+            return
+        cfg = _pp_config_from_steps(input_dir, output_dir, max_items, recursive, shuffle, steps, num_workers)
+        cache = {}
+
+        def to_arrays(paths):
+            arrs = []
+            for p in (paths or []):
+                if p not in cache:
+                    try:
+                        cache[p] = np.asarray(Image.open(p).convert('RGB'))
+                    except Exception:
+                        cache[p] = None
+                if cache[p] is not None:
+                    arrs.append(cache[p])
+            return arrs
+
         for log, prev in PP.run_pipeline(cfg):
-            yield log, prev
+            yield log, to_arrays(prev)
     except Exception:
         yield ('전처리 중 예외:\n' + traceback.format_exc(), [])
 
 
+def pp_train_reference(optical_dir, save_path, bins, max_items):
+    """Pre-train: build the optical histogram CDF and save it to .npy for preset use."""
+    import preprocessing as PP
+    if not optical_dir or not os.path.isdir(optical_dir):
+        return f'오류: Optical 폴더가 없습니다: {optical_dir}'
+    save_path = (save_path or './optical_hist.npy').strip()
+    try:
+        path, nbins = PP.save_reference_cdf(optical_dir, save_path,
+                                            bins=int(bins or 1024), max_items=int(max_items or 0))
+        return (f'✅ 사전 히스토그램 저장 완료: {os.path.abspath(path)}  (bins={nbins})\n'
+                f'→ histogram_mapping 스텝을 모드 "preset" 으로 두고 '
+                f'"사전 히스토그램 .npy 경로" 에 위 경로를 넣으면 SAR만으로 매핑됩니다.')
+    except Exception:
+        return '사전 히스토그램 학습 실패:\n' + traceback.format_exc()
+
+
 def pp_metrics(output_dir, max_items):
-    """SAR preprocessing quality metrics averaged over <output_dir>/images."""
+    """SAR preprocessing quality metrics averaged over <output_dir>/images.
+
+    A per-image CSV + summary log is written under <output_dir>/metrics_logs/.
+    """
     import preprocessing as PP
     img_dir = os.path.join(output_dir or '', 'images')
+    save_dir = output_dir or '.'
     if not os.path.isdir(img_dir):
         # allow pointing directly at a folder of images too
         img_dir = output_dir or ''
+        save_dir = output_dir or '.'
     try:
-        res = PP.compute_dataset_metrics(img_dir, max_items=int(max_items or 0))
-        return PP.format_metrics(res)
+        res = PP.compute_dataset_metrics(img_dir, max_items=int(max_items or 0), save_dir=save_dir)
+        out = PP.format_metrics(res)
+        if res and res.get('saved'):
+            out += f'\n\n📝 로그 저장: {os.path.abspath(res["saved"])}\n   (metrics_logs 폴더에 CSV/TXT/JSON)'
+        return out
     except Exception:
         return '지표 계산 오류:\n' + traceback.format_exc()
 
@@ -1238,10 +1340,12 @@ def build_ui():
                         e_ign = gr.Checkbox(True, label='0값 제외')
                 with gr.Group(visible=False) as g_hist:
                     with gr.Row():
-                        e_histmode = gr.Dropdown(PP.HISTOGRAM_MODES, value='sar_only', label='histogram 모드')
+                        e_histmode = gr.Dropdown(PP.HISTOGRAM_MODES, value='sar_only',
+                                                 label='histogram 모드 (sar_only / unpaired_optical_reference / preset)')
                         e_bins = gr.Number(1024, label='bins', precision=0)
                         e_clahe = gr.Checkbox(False, label='CLAHE')
-                    e_optref = gr.Textbox('', label='Optical 참조 폴더 (unpaired 모드)')
+                    e_optref = gr.Textbox('', label='Optical 참조 폴더 (unpaired_optical_reference 모드)')
+                    e_refcdf = gr.Textbox('', label='사전 히스토그램 .npy 경로 (preset 모드: 아래 ④에서 먼저 학습/저장)')
                 with gr.Group(visible=False) as g_resize:
                     e_size = gr.Number(256, label='resize image_size', precision=0)
                 with gr.Group(visible=False) as g_chan:
@@ -1250,7 +1354,7 @@ def build_ui():
 
             edit_widgets = [e_method, e_window, e_enlauto, e_enlval, e_damp, e_sigauto,
                             e_sigval, e_intmode, e_cmin, e_cmax, e_ign, e_histmode,
-                            e_bins, e_optref, e_clahe, e_size, e_ch]
+                            e_bins, e_optref, e_clahe, e_size, e_ch, e_refcdf]
             edit_groups = [g_spk, g_int, g_clip, g_hist, g_resize, g_chan]
 
             pp_add_btn.click(pp_add_category, inputs=[pp_steps, pp_addcat, pp_sel],
@@ -1271,6 +1375,23 @@ def build_ui():
 
             pp_io_inputs = [pp_steps, pp_in, pp_out, pp_max, pp_recursive, pp_shuffle, pp_workers]
             pp_save_btn.click(pp_save_btn_fn, inputs=pp_io_inputs, outputs=pp_save_msg)
+
+            with gr.Accordion('④ Optical 사전 히스토그램 학습/저장 (preset 모드용)', open=True):
+                gr.Markdown(
+                    'N장의 **Optical 이미지 폴더**로 히스토그램(CDF)을 미리 학습해 `.npy` 로 저장합니다. '
+                    '이후 **SAR 이미지만 있어도** histogram_mapping 모드를 `preset` 으로 두고 이 파일을 참조하면 '
+                    'SAR 히스토그램을 Optical 분포에 맞춥니다.')
+                with gr.Row():
+                    pp_tr_opt = gr.Textbox('./datasets/Optical/trainB', label='Optical 이미지 폴더 (학습용 N장)')
+                    pp_tr_save = gr.Textbox('./optical_hist.npy', label='저장 경로 (.npy)')
+                with gr.Row():
+                    pp_tr_bins = gr.Number(1024, label='bins', precision=0)
+                    pp_tr_max = gr.Number(0, label='사용 개수 (0=전체)', precision=0)
+                    pp_tr_btn = gr.Button('🧠 사전 히스토그램 학습/저장', variant='primary')
+                pp_tr_msg = gr.Textbox(label='결과', lines=4, interactive=False)
+                pp_tr_btn.click(pp_train_reference,
+                                inputs=[pp_tr_opt, pp_tr_save, pp_tr_bins, pp_tr_max],
+                                outputs=pp_tr_msg)
 
             with gr.Accordion('⑤ 미리보기 (Before / After)', open=True):
                 pp_prev_btn = gr.Button('🔍 첫 이미지 미리보기')
@@ -1355,8 +1476,27 @@ def build_ui():
                 comp['num_patches'] = gr.Number(cfg['num_patches'], label='num_patches', precision=0)
             with gr.Row():
                 comp['nce_T'] = gr.Number(cfg['nce_T'], label='nce_T (temperature)')
-                comp['nce_layers'] = gr.Textbox(cfg['nce_layers'], label='nce_layers (attention 시 자동 보정됨)')
                 comp['nce_idt'] = gr.Checkbox(bool(cfg['nce_idt']), label='nce_idt')
+            with gr.Row():
+                comp['nce_layers'] = gr.Textbox(
+                    cfg['nce_layers'],
+                    label='nce_layers (PatchNCE tap, 쉼표구분 · 직접 지정하면 그대로 사용)')
+                nce_reco_btn = gr.Button('🔢 현재 설정 권장값 계산')
+            gr.Markdown(
+                'ℹ️ PatchNCE tap은 직접 지정할 수 있습니다. netG/attention/no_antialias 설정을 바꾼 뒤 '
+                '**권장값 계산**을 누르면 현재 구조에 맞는 인덱스가 채워집니다(이후 자유롭게 편집). '
+                '비워두거나 기본값(0,4,8,12,16)이면 학습 시 자동 보정됩니다. '
+                'hrnet은 0 ~ (branches+1) 범위만 유효합니다.')
+            with gr.Accordion('HRNet 전용 옵션 (netG=hrnet일 때만 적용)', open=False):
+                with gr.Row():
+                    comp['hrnet_branches'] = gr.Number(cfg['hrnet_branches'], precision=0,
+                                                       label='branches (병렬 해상도 스트림 수, 2~4)')
+                    comp['hrnet_modules'] = gr.Number(cfg['hrnet_modules'], precision=0,
+                                                      label='modules (융합 모듈 수 = 깊이)')
+                    comp['hrnet_blocks'] = gr.Number(cfg['hrnet_blocks'], precision=0,
+                                                     label='blocks (브랜치당 residual 블록 수 = 폭)')
+                gr.Markdown('branches↑/modules↑/blocks↑ → 표현력·디테일↑, 메모리·시간↑. '
+                            'branches를 바꾸면 PatchNCE tap 수도 바뀌니 위 **권장값 계산**을 다시 누르세요.')
             with gr.Row():
                 comp['lambda_GAN'] = gr.Number(cfg['lambda_GAN'], label='lambda_GAN')
                 comp['lambda_NCE'] = gr.Number(cfg['lambda_NCE'], label='lambda_NCE')
@@ -1417,6 +1557,13 @@ def build_ui():
         save_cut.click(do_save, inputs=[cfg_path] + ordered_inputs, outputs=save_cut_out)
         save_att.click(do_save, inputs=[cfg_path] + ordered_inputs, outputs=save_att_out)
 
+        # fill nce_layers with the recommended taps for the current architecture
+        nce_reco_btn.click(
+            gui_recommend_nce,
+            inputs=[comp['netG'], comp['attention_type'], comp['attention_encoder'],
+                    comp['no_antialias'], comp['hrnet_branches']],
+            outputs=comp['nce_layers'])
+
         # Organize button (Tab 0) auto-fills the dataroot on completion.
         org_btn.click(organize_m4sar_to_cut,
                       inputs=[org_src, org_out, org_sar_kw, org_opt_kw, org_mode, org_ratio],
@@ -1474,7 +1621,16 @@ def main():
               '127.0.0.1 / localhost 는 Colab에서 접속되지 않습니다.\n')
 
     demo = build_ui()
-    demo.queue().launch(share=share, server_port=args.port)
+    # show_error=True surfaces the real exception text in the UI toast instead of
+    # a generic "오류", which is essential for diagnosing environment-specific
+    # failures. allowed_paths lets Gradio serve result files from the working
+    # tree (defence-in-depth alongside the numpy-array gallery output).
+    try:
+        demo.queue().launch(share=share, server_port=args.port,
+                            show_error=True, allowed_paths=[os.getcwd()])
+    except TypeError:
+        # older Gradio without allowed_paths / show_error
+        demo.queue().launch(share=share, server_port=args.port, show_error=True)
 
 
 if __name__ == '__main__':
