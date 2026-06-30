@@ -61,6 +61,13 @@ IN_COLAB = _detect_colab()
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
+# Build marker — bump when the GUI changes so you can confirm the running file is
+# up to date (printed on launch and shown in the UI header). If the version you
+# see in the browser/console does not match the latest, you are running an old
+# copy and must replace gui.py / preprocessing/.
+BUILD = '2026-06-30.4 (robust-preproc+numpy-gallery+metrics-log)'
+
+
 # --------------------------------------------------------------------------- #
 # Configuration handling
 # --------------------------------------------------------------------------- #
@@ -1210,6 +1217,8 @@ def build_ui():
                     '각 탭에서 값을 수정하고 **저장** 버튼을 누르면 `gui_config.json`에 보존됩니다. '
                     '학습/추론은 이 저장소의 `train.py` / `test.py` 를 실행합니다.')
 
+        gr.Markdown(f'<sub>build: <code>{BUILD}</code> · gradio {getattr(gr, "__version__", "?")}</sub>')
+
         cfg_path = gr.Textbox(value=DEFAULT_CONFIG_PATH, label='설정 파일 경로 (config json)')
 
         env_txt = ('🟢 Colab 환경 감지됨 — 데이터셋 다운로드 사용 가능'
@@ -1620,6 +1629,7 @@ def main():
         print('\n[gui] Colab 감지됨. 출력의 공개 URL (https://XXXX.gradio.live) 을 클릭하세요. '
               '127.0.0.1 / localhost 는 Colab에서 접속되지 않습니다.\n')
 
+    print(f'[gui] build {BUILD}  (gradio {getattr(gr, "__version__", "?")})')
     demo = build_ui()
     # show_error=True surfaces the real exception text in the UI toast instead of
     # a generic "오류", which is essential for diagnosing environment-specific
