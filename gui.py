@@ -1113,15 +1113,37 @@ def pp_preview(steps, input_dir, output_dir, max_items, recursive, shuffle, num_
 
 
 def pp_run(steps, input_dir, output_dir, max_items, recursive, shuffle, num_workers):
+    # Feed the gallery in-memory numpy arrays (not file paths). Returning a local
+    # file path to a gr.Gallery can raise in Gradio's output postprocess when the
+    # file is outside the allowed paths — that exception fires OUTSIDE this
+    # function, killing the stream right after the first preview appears (the
+    # "1장만 처리되고 오류" symptom). Numpy arrays are encoded by Gradio itself,
+    # so there is no path validation and it works on every platform/version.
+    import numpy as np
+    from PIL import Image
     import preprocessing as PP
-    pp_save_settings(steps, input_dir, output_dir, max_items, recursive, shuffle, num_workers)
-    if not steps:
-        yield '파이프라인에 스텝이 없습니다.', []
-        return
-    cfg = _pp_config_from_steps(input_dir, output_dir, max_items, recursive, shuffle, steps, num_workers)
     try:
+        pp_save_settings(steps, input_dir, output_dir, max_items, recursive, shuffle, num_workers)
+        if not steps:
+            yield '파이프라인에 스텝이 없습니다.', []
+            return
+        cfg = _pp_config_from_steps(input_dir, output_dir, max_items, recursive, shuffle, steps, num_workers)
+        cache = {}
+
+        def to_arrays(paths):
+            arrs = []
+            for p in (paths or []):
+                if p not in cache:
+                    try:
+                        cache[p] = np.asarray(Image.open(p).convert('RGB'))
+                    except Exception:
+                        cache[p] = None
+                if cache[p] is not None:
+                    arrs.append(cache[p])
+            return arrs
+
         for log, prev in PP.run_pipeline(cfg):
-            yield log, prev
+            yield log, to_arrays(prev)
     except Exception:
         yield ('전처리 중 예외:\n' + traceback.format_exc(), [])
 
@@ -1599,7 +1621,16 @@ def main():
               '127.0.0.1 / localhost 는 Colab에서 접속되지 않습니다.\n')
 
     demo = build_ui()
-    demo.queue().launch(share=share, server_port=args.port)
+    # show_error=True surfaces the real exception text in the UI toast instead of
+    # a generic "오류", which is essential for diagnosing environment-specific
+    # failures. allowed_paths lets Gradio serve result files from the working
+    # tree (defence-in-depth alongside the numpy-array gallery output).
+    try:
+        demo.queue().launch(share=share, server_port=args.port,
+                            show_error=True, allowed_paths=[os.getcwd()])
+    except TypeError:
+        # older Gradio without allowed_paths / show_error
+        demo.queue().launch(share=share, server_port=args.port, show_error=True)
 
 
 if __name__ == '__main__':
