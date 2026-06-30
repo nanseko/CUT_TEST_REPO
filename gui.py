@@ -65,7 +65,7 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 # up to date (printed on launch and shown in the UI header). If the version you
 # see in the browser/console does not match the latest, you are running an old
 # copy and must replace gui.py / preprocessing/.
-BUILD = '2026-06-30.4 (robust-preproc+numpy-gallery+metrics-log)'
+BUILD = '2026-06-30.5 (order-search+robust-preproc+numpy-gallery+metrics-log)'
 
 
 # --------------------------------------------------------------------------- #
@@ -1171,6 +1171,20 @@ def pp_train_reference(optical_dir, save_path, bins, max_items):
         return '사전 히스토그램 학습 실패:\n' + traceback.format_exc()
 
 
+def pp_optimize(sar_dir, out_dir, n1, n2, topk, primary, hist_mode, optical):
+    """Resumable two-stage search for the best preprocessing step order (one button)."""
+    import preprocessing as PP
+    try:
+        for line in PP.optimize_orders(
+                sar_dir, out_dir or './datasets/_order_search',
+                n_stage1=int(n1 or 200), n_stage2=int(n2 or 1000),
+                top_k=int(topk or 10), primary=primary,
+                hist_mode=hist_mode, optical_dir=(optical or None)):
+            yield line
+    except Exception:
+        yield '순서 최적화 중 예외:\n' + traceback.format_exc()
+
+
 def pp_metrics(output_dir, max_items):
     """SAR preprocessing quality metrics averaged over <output_dir>/images.
 
@@ -1440,6 +1454,33 @@ def build_ui():
                     pp_met_btn = gr.Button('📊 성능 지표 계산', variant='primary')
                 pp_met_out = gr.Textbox(label='성능 지표 결과', lines=10, interactive=False)
                 pp_met_btn.click(pp_metrics, inputs=[pp_out, pp_met_max], outputs=pp_met_out)
+
+            with gr.Accordion('⑧ 전처리 순서 자동 최적화 (버튼 하나 · 재개 가능)', open=False):
+                gr.Markdown(
+                    '의미있는 4스텝(intensity · speckle · clipping · histogram)을 **전수 순열(24) × speckle(5) = 120 후보**로, '
+                    '이미지 평가지표(PSNR·CC·EPI, 원본 SAR 기준)로 **2단계 평가**(stage1 랭킹 → 상위 K개 stage2 재평가)하여 '
+                    '최적 순서를 자동 선정합니다.\n'
+                    '- validate=맨앞, resize→channel→normalize=맨뒤로 고정됩니다.\n'
+                    '- **중단해도** 결과 CSV에 기록된 완료 순서는 다시 실행하지 않습니다(재개 가능).\n'
+                    '- 결과: `<결과폴더>/order_search_results.csv` (순서·speckle·지표), `best_pipeline.json` (최적 순서).')
+                with gr.Row():
+                    opt_sar = gr.Textbox('./datasets/M4-SAR/raw_sar', label='SAR 입력 폴더')
+                    opt_out = gr.Textbox('./datasets/_order_search', label='결과/로그 폴더')
+                with gr.Row():
+                    opt_n1 = gr.Number(200, label='stage1 평가 장수', precision=0)
+                    opt_n2 = gr.Number(1000, label='stage2 평가 장수', precision=0)
+                    opt_topk = gr.Number(10, label='stage2 상위 K개', precision=0)
+                with gr.Row():
+                    opt_primary = gr.Dropdown(['composite', 'epi', 'psnr', 'cc'],
+                                              value='composite', label='랭킹 기준 지표')
+                    opt_hist = gr.Dropdown(PP.HISTOGRAM_MODES, value='sar_only', label='histogram 모드')
+                    opt_optical = gr.Textbox('', label='Optical 폴더(unpaired) 또는 .npy(preset)')
+                opt_btn = gr.Button('🚀 순서 자동 최적화 실행', variant='primary')
+                opt_log = gr.Textbox(label='최적화 진행/결과 로그', lines=18, interactive=False, max_lines=18)
+                opt_btn.click(pp_optimize,
+                              inputs=[opt_sar, opt_out, opt_n1, opt_n2, opt_topk,
+                                      opt_primary, opt_hist, opt_optical],
+                              outputs=opt_log)
 
         # ---- Tab 3 : Basic training params ----------------------------- #
         with gr.Tab('3. 기본 학습 파라미터'):
