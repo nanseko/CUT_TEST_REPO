@@ -65,7 +65,7 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 # up to date (printed on launch and shown in the UI header). If the version you
 # see in the browser/console does not match the latest, you are running an old
 # copy and must replace gui.py / preprocessing/.
-BUILD = '2026-06-30.5 (order-search+robust-preproc+numpy-gallery+metrics-log)'
+BUILD = '2026-06-30.6 (order-search+FID-EO+robust-preproc)'
 
 
 # --------------------------------------------------------------------------- #
@@ -1171,7 +1171,8 @@ def pp_train_reference(optical_dir, save_path, bins, max_items):
         return '사전 히스토그램 학습 실패:\n' + traceback.format_exc()
 
 
-def pp_optimize(sar_dir, out_dir, n1, n2, topk, primary, hist_mode, optical):
+def pp_optimize(sar_dir, out_dir, n1, n2, topk, primary, hist_mode, optical,
+                eo_dir, use_fid, fid_max):
     """Resumable two-stage search for the best preprocessing step order (one button)."""
     import preprocessing as PP
     try:
@@ -1179,7 +1180,9 @@ def pp_optimize(sar_dir, out_dir, n1, n2, topk, primary, hist_mode, optical):
                 sar_dir, out_dir or './datasets/_order_search',
                 n_stage1=int(n1 or 200), n_stage2=int(n2 or 1000),
                 top_k=int(topk or 10), primary=primary,
-                hist_mode=hist_mode, optical_dir=(optical or None)):
+                hist_mode=hist_mode, optical_dir=(optical or None),
+                eo_dir=(eo_dir or None), compute_fid=bool(use_fid),
+                fid_max=int(fid_max or 500)):
             yield line
     except Exception:
         yield '순서 최적화 중 예외:\n' + traceback.format_exc()
@@ -1471,15 +1474,22 @@ def build_ui():
                     opt_n2 = gr.Number(1000, label='stage2 평가 장수', precision=0)
                     opt_topk = gr.Number(10, label='stage2 상위 K개', precision=0)
                 with gr.Row():
-                    opt_primary = gr.Dropdown(['composite', 'epi', 'psnr', 'cc'],
-                                              value='composite', label='랭킹 기준 지표')
+                    opt_primary = gr.Dropdown(['fid', 'composite', 'epi', 'enl', 'speckle_index', 'psnr', 'cc'],
+                                              value='fid', label='랭킹 기준 지표 (SAR→EO는 fid 권장)')
                     opt_hist = gr.Dropdown(PP.HISTOGRAM_MODES, value='sar_only', label='histogram 모드')
-                    opt_optical = gr.Textbox('', label='Optical 폴더(unpaired) 또는 .npy(preset)')
+                    opt_optical = gr.Textbox('', label='histogram용 Optical 폴더/.npy (unpaired/preset 시)')
+                gr.Markdown('**FID (EO 도메인 근접도, 낮을수록 좋음)** — SAR→EO 성능과 가장 직접적인 참고치입니다. '
+                            'stage2 상위 후보에 대해서만 EO 세트 대비 계산합니다. (torch+torchvision 필요, 첫 실행 시 InceptionV3 가중치 다운로드)')
+                with gr.Row():
+                    opt_eo = gr.Textbox('./datasets/Optical/trainB', label='EO(광학) 참조 폴더 (FID 기준)')
+                    opt_use_fid = gr.Checkbox(True, label='FID 계산 (stage2)')
+                    opt_fid_max = gr.Number(500, label='FID 평가 장수 (EO/후보 각각)', precision=0)
                 opt_btn = gr.Button('🚀 순서 자동 최적화 실행', variant='primary')
                 opt_log = gr.Textbox(label='최적화 진행/결과 로그', lines=18, interactive=False, max_lines=18)
                 opt_btn.click(pp_optimize,
                               inputs=[opt_sar, opt_out, opt_n1, opt_n2, opt_topk,
-                                      opt_primary, opt_hist, opt_optical],
+                                      opt_primary, opt_hist, opt_optical,
+                                      opt_eo, opt_use_fid, opt_fid_max],
                               outputs=opt_log)
 
         # ---- Tab 3 : Basic training params ----------------------------- #
