@@ -65,7 +65,7 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 # up to date (printed on launch and shown in the UI header). If the version you
 # see in the browser/console does not match the latest, you are running an old
 # copy and must replace gui.py / preprocessing/.
-BUILD = '2026-06-30.6 (order-search+FID-EO+robust-preproc)'
+BUILD = '2026-06-30.7 (offline-FID-weights+order-search)'
 
 
 # --------------------------------------------------------------------------- #
@@ -1172,7 +1172,7 @@ def pp_train_reference(optical_dir, save_path, bins, max_items):
 
 
 def pp_optimize(sar_dir, out_dir, n1, n2, topk, primary, hist_mode, optical,
-                eo_dir, use_fid, fid_max):
+                eo_dir, use_fid, fid_max, inception_weights):
     """Resumable two-stage search for the best preprocessing step order (one button)."""
     import preprocessing as PP
     try:
@@ -1182,7 +1182,8 @@ def pp_optimize(sar_dir, out_dir, n1, n2, topk, primary, hist_mode, optical,
                 top_k=int(topk or 10), primary=primary,
                 hist_mode=hist_mode, optical_dir=(optical or None),
                 eo_dir=(eo_dir or None), compute_fid=bool(use_fid),
-                fid_max=int(fid_max or 500)):
+                fid_max=int(fid_max or 500),
+                inception_weights=(inception_weights or None)):
             yield line
     except Exception:
         yield '순서 최적화 중 예외:\n' + traceback.format_exc()
@@ -1484,12 +1485,16 @@ def build_ui():
                     opt_eo = gr.Textbox('./datasets/Optical/trainB', label='EO(광학) 참조 폴더 (FID 기준)')
                     opt_use_fid = gr.Checkbox(True, label='FID 계산 (stage2)')
                     opt_fid_max = gr.Number(500, label='FID 평가 장수 (EO/후보 각각)', precision=0)
+                opt_incw = gr.Textbox(
+                    '', label='InceptionV3 가중치 .pth 경로 (오프라인/사내망용, 비우면 자동탐색·캐시·다운로드)')
+                gr.Markdown('오프라인이면 `inception_v3_google-0cc3c7bd.pth` 를 미리 받아 위 경로에 지정하거나, '
+                            '`weights/` 폴더에 두거나, 환경변수 `INCEPTION_WEIGHTS` 로 지정하세요. (자세한 방법은 docs)')
                 opt_btn = gr.Button('🚀 순서 자동 최적화 실행', variant='primary')
                 opt_log = gr.Textbox(label='최적화 진행/결과 로그', lines=18, interactive=False, max_lines=18)
                 opt_btn.click(pp_optimize,
                               inputs=[opt_sar, opt_out, opt_n1, opt_n2, opt_topk,
                                       opt_primary, opt_hist, opt_optical,
-                                      opt_eo, opt_use_fid, opt_fid_max],
+                                      opt_eo, opt_use_fid, opt_fid_max, opt_incw],
                               outputs=opt_log)
 
         # ---- Tab 3 : Basic training params ----------------------------- #

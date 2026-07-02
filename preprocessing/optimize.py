@@ -211,11 +211,50 @@ def fid_available():
         return False
 
 
-def _load_inception(device='cpu'):
+INCEPTION_FILENAME = 'inception_v3_google-0cc3c7bd.pth'
+
+
+def _default_weights_paths():
+    """Local locations searched for the InceptionV3 weights (offline support)."""
+    paths = []
+    env = os.environ.get('INCEPTION_WEIGHTS')
+    if env:
+        paths.append(env)
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(here)
+    for base in ('.', './weights', './models', here, repo,
+                 os.path.join(repo, 'weights'), os.path.join(repo, 'models')):
+        paths.append(os.path.join(base, INCEPTION_FILENAME))
+    return paths
+
+
+def resolve_inception_weights(explicit=None):
+    """Return a local weights path if found (explicit -> env -> common dirs), else None."""
+    for p in ([explicit] if explicit else []) + _default_weights_paths():
+        if p and os.path.exists(p):
+            return p
+    return None
+
+
+def _load_inception(device='cpu', weights_path=None):
     import torch
     import torchvision.transforms as T
     from torchvision.models import inception_v3, Inception_V3_Weights
-    net = inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1)
+    wp = resolve_inception_weights(weights_path)
+    if wp:
+        # offline: build without downloading, then load local weights
+        try:
+            net = inception_v3(weights=None, init_weights=False)
+        except TypeError:
+            net = inception_v3(weights=None)
+        sd = torch.load(wp, map_location=device)
+        try:
+            net.load_state_dict(sd)
+        except Exception:
+            net.load_state_dict(sd, strict=False)
+    else:
+        # online: torchvision uses its cache or downloads once
+        net = inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1)
     net.fc = torch.nn.Identity()      # 2048-d pool features
     net.eval().to(device)
     tf = T.Compose([T.ToPILImage(), T.Resize((299, 299)), T.ToTensor(),
@@ -307,7 +346,8 @@ def _load_done(results_csv):
 def optimize_orders(sar_dir, out_dir, n_stage1=200, n_stage2=1000, top_k=10,
                     primary='composite', hist_mode='sar_only',
                     optical_dir=None, max_scan=0,
-                    eo_dir=None, compute_fid=False, fid_max=500, device=None):
+                    eo_dir=None, compute_fid=False, fid_max=500, device=None,
+                    inception_weights=None):
     """Generator yielding log strings. Writes results CSV (resumable) + best.json."""
     os.makedirs(out_dir, exist_ok=True)
     results_csv = os.path.join(out_dir, 'order_search_results.csv')
@@ -361,8 +401,10 @@ def optimize_orders(sar_dir, out_dir, n_stage1=200, n_stage2=1000, top_k=10,
             try:
                 import torch
                 fid_dev = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-                yield log(f'FID용 InceptionV3 로드 중 (device={fid_dev}) ...')
-                fid_net, fid_tf = _load_inception(fid_dev)
+                wp = resolve_inception_weights(inception_weights)
+                yield log(f'FID용 InceptionV3 로드 중 (device={fid_dev}, '
+                          f'가중치={"로컬:" + wp if wp else "torch 캐시/다운로드"}) ...')
+                fid_net, fid_tf = _load_inception(fid_dev, inception_weights)
                 eo_files = scan_images(eo_dir, recursive=True, shuffle=True, seed=42,
                                        max_items=int(fid_max or 0))
                 yield log(f'EO 세트 {len(eo_files)}장으로 기준 특징 추출 중 ...')

@@ -35,6 +35,7 @@ try:
     from preprocessing.optimize import (
         optimize_orders, enumerate_candidates, build_pipeline_steps,
         evaluate_pipeline, PERMUTE_STEPS,
+        resolve_inception_weights, INCEPTION_FILENAME,
     )
     __all__ += [
         'save_reference_cdf', 'load_reference_cdf',
@@ -42,6 +43,7 @@ try:
         'METRIC_INFO', 'METRIC_KEYS',
         'optimize_orders', 'enumerate_candidates', 'build_pipeline_steps',
         'evaluate_pipeline', 'PERMUTE_STEPS',
+        'resolve_inception_weights', 'INCEPTION_FILENAME',
     ]
     FEATURES_OK = True
 except Exception as _exc:  # stale / partially-updated files
