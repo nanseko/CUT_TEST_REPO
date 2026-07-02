@@ -16,6 +16,10 @@ from preprocessing.metrics import (
     compute_dataset_metrics, image_metrics, format_metrics, save_metrics_log,
     METRIC_INFO, METRIC_KEYS,
 )
+from preprocessing.optimize import (
+    optimize_orders, enumerate_candidates, build_pipeline_steps,
+    evaluate_pipeline, PERMUTE_STEPS,
+)
 
 __all__ = [
     'run_pipeline', 'preprocess_single', 'scan_images', 'export_cut_layout',
@@ -25,4 +29,6 @@ __all__ = [
     'HISTOGRAM_MODES', 'INTENSITY_MODES',
     'compute_dataset_metrics', 'image_metrics', 'format_metrics', 'save_metrics_log',
     'METRIC_INFO', 'METRIC_KEYS',
+    'optimize_orders', 'enumerate_candidates', 'build_pipeline_steps',
+    'evaluate_pipeline', 'PERMUTE_STEPS',
 ]
