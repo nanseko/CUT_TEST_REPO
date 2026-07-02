@@ -301,6 +301,16 @@ def fid_from_feats(fa, fb):
                  - 2.0 * _sqrtm_trace(sa, sb))
 
 
+def _read_rgb_arrays(files):
+    """Yield each image as an RGB uint8 numpy array (for FID feature extraction)."""
+    from PIL import Image
+    for p in files:
+        try:
+            yield np.asarray(Image.open(p).convert('RGB'))
+        except Exception:
+            continue
+
+
 def _pipeline_output_arrays(order, speckle_method, files, hist_mode, optical_target):
     """Yield the final preprocessed uint8 3ch image for each file (for FID)."""
     steps = build_steps(build_pipeline_steps(order, speckle_method, hist_mode=hist_mode))
@@ -409,8 +419,7 @@ def optimize_orders(sar_dir, out_dir, n_stage1=200, n_stage2=1000, top_k=10,
                                        max_items=int(fid_max or 0))
                 yield log(f'EO 세트 {len(eo_files)}장으로 기준 특징 추출 중 ...')
                 eo_feats = _features_from_arrays(
-                    (np.asarray(__import__('PIL.Image', fromlist=['Image']).Image.open(p).convert('RGB'))
-                     for p in eo_files), fid_net, fid_tf, fid_dev)
+                    _read_rgb_arrays(eo_files), fid_net, fid_tf, fid_dev)
                 fid_on = eo_feats.shape[0] >= 2
                 yield log(f'FID 활성화: EO 특징 {eo_feats.shape[0]}개 (stage2 상위 {top_k}개에 대해 계산)')
             except Exception:
