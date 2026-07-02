@@ -11,3 +11,7 @@ preproc_config.json
 
 # datasets
 /datasets/*/
+
+# large model weights (offline FID)
+weights/
+*.pth
