@@ -65,7 +65,7 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 # up to date (printed on launch and shown in the UI header). If the version you
 # see in the browser/console does not match the latest, you are running an old
 # copy and must replace gui.py / preprocessing/.
-BUILD = '2026-06-30.7 (offline-FID-weights+order-search)'
+BUILD = '2026-07-02.1 (cut-output-evaluation+shared-fid-utils)'
 
 
 # --------------------------------------------------------------------------- #
@@ -73,6 +73,18 @@ BUILD = '2026-06-30.7 (offline-FID-weights+order-search)'
 # --------------------------------------------------------------------------- #
 
 DEFAULT_CONFIG_PATH = './gui_config.json'
+
+# kept as a literal (not imported from evaluation.EVAL_CSV_COLUMNS) so the GUI
+# module can build its layout even if evaluation/ is temporarily mismatched;
+# must stay in sync with evaluation/evaluate.py's EVAL_CSV_COLUMNS.
+EVAL_TABLE_HEADERS = [
+    'timestamp', 'experiment', 'checkpoint_epoch', 'n_fake', 'n_eo',
+    'fid', 'kid', 'struct_epi', 'struct_cc', 'struct_psnr', 'n_struct_pairs',
+    'idt_psnr', 'idt_ssim', 'n_idt_pairs',
+    'quality_mean', 'quality_std', 'quality_speckle_index', 'quality_enl',
+    'quality_avg_gradient', 'quality_entropy',
+    'notes',
+]
 
 # Stable key order. The Gradio input list is assembled in exactly this order so
 # every Save / Start button can collect the whole config consistently.
@@ -619,6 +631,39 @@ def run_inference(num_test, epoch, *cfg_values):
                    f'\n\n(결과 이미지를 찾지 못했습니다: {out_dir})', gallery)
     except Exception:
         yield ('추론 중 예외 발생:\n' + traceback.format_exc(), gallery)
+
+
+def eval_table_rows(results_dir, name):
+    """Read the logged evaluation rows for the GUI comparison table."""
+    import evaluation as EV
+    rows = EV.load_eval_log(results_dir, name)
+    return [[r.get(c, '') for c in EV.EVAL_CSV_COLUMNS] for r in rows]
+
+
+def cut_evaluate(epoch, experiment, notes, eo_dir, compute_identity, real_b_dir,
+                 inception_weights, fid_max, quality_max, struct_max, *cfg_values):
+    """One-button CUT output evaluation (FID/KID vs EO, structure vs real_A,
+    optional identity-path vs G(real_B), no-reference quality). Reads outputs
+    already produced by '7. 추론/테스트' (test.py) and logs a comparison row
+    under <results_dir>/<name>/eval_logs/eval_results.csv."""
+    import evaluation as EV
+    cfg = _cfg_from_values(cfg_values)
+    epoch = (epoch or 'latest').strip() or 'latest'
+    try:
+        last = ''
+        for line in EV.run_evaluation(
+                results_dir=cfg['results_dir'], name=cfg['name'], epoch=epoch,
+                experiment=(experiment or cfg['name']), notes=notes,
+                eo_dir=(eo_dir or None), checkpoints_dir=cfg['checkpoints_dir'], cfg=cfg,
+                compute_identity=bool(compute_identity), real_b_dir=(real_b_dir or None),
+                inception_weights=(inception_weights or None),
+                fid_max=int(fid_max or 500), quality_max=int(quality_max or 0),
+                struct_max=int(struct_max or 0)):
+            last = line
+            yield last, eval_table_rows(cfg['results_dir'], cfg['name'])
+    except Exception:
+        yield ('평가 중 예외:\n' + traceback.format_exc(),
+              eval_table_rows(cfg['results_dir'], cfg['name']))
 
 
 # --------------------------------------------------------------------------- #
@@ -1668,6 +1713,46 @@ def build_ui():
             inf_btn.click(run_inference,
                           inputs=[inf_num, inf_epoch] + ordered_inputs,
                           outputs=[inf_status, inf_gallery])
+
+        # ---- Tab 8 : Model evaluation (CUT outputs) --------------------- #
+        with gr.Tab('8. 모델 평가 (CUT 출력)'):
+            gr.Markdown(
+                '**"7. 추론/테스트"로 생성된 결과**(`results_dir/name/test_<epoch>/images/{fake_B,real_A,real_B}`)'
+                ' 를 평가합니다. 백본(ResNet/HRNet)·attention·lambda 값을 바꿀 때마다 **실험명**을 다르게 주고 '
+                '실행하면 아래 비교표에 누적되어 설정 간 비교가 됩니다.\n\n'
+                '- **FID / KID** (↓ 낮을수록 좋음): fake_B ↔ EO 참조 세트. SAR→EO 도메인 근접도(핵심 지표).\n'
+                '- **EPI / CC / PSNR** (↑): real_A ↔ fake_B. 구조·에지 보존(허상 가드레일).\n'
+                '- **idt PSNR / SSIM** (↑): real_B ↔ idt_B=G(real_B) — 짝 데이터라 정확한 비교. 백본 변경 시 유용.\n'
+                '- **품질 지표**: fake_B 단독(선명도·대비·정보량), 무참조.')
+            with gr.Row():
+                eval_epoch = gr.Textbox('latest', label='epoch (테스트에 사용한 값과 동일하게)')
+                eval_exp = gr.Textbox('', label='실험명 (비워두면 name 사용, 예: hrnet_coord_lgrad1.0)')
+            eval_notes = gr.Textbox('', label='메모 (선택)')
+            with gr.Row():
+                eval_eo = gr.Textbox('./datasets/Optical/trainB', label='EO(광학) 참조 폴더 (FID/KID 기준)')
+                eval_incw = gr.Textbox('', label='InceptionV3 가중치 .pth 경로 (오프라인용, 비우면 자동탐색)')
+            with gr.Row():
+                eval_id_on = gr.Checkbox(True, label='Identity 평가(idt_B 생성, 탭4/5 설정과 동일한 체크포인트 사용)')
+                eval_real_b = gr.Textbox('', label='real_B 폴더 (비우면 test 결과의 real_B 자동 사용)')
+            with gr.Row():
+                eval_fid_max = gr.Number(500, label='FID/KID 평가 장수', precision=0)
+                eval_struct_max = gr.Number(0, label='구조 평가 장수 (0=전체)', precision=0)
+                eval_qual_max = gr.Number(0, label='품질 평가 장수 (0=전체)', precision=0)
+            eval_btn = gr.Button('▶ 평가 실행', variant='primary')
+            eval_log = gr.Textbox(label='평가 진행/결과 로그', lines=14, interactive=False, max_lines=14)
+            gr.Markdown('**실험 비교표** (실행할 때마다 누적, `eval_results.csv`)')
+            eval_table = gr.Dataframe(headers=EVAL_TABLE_HEADERS, wrap=True,
+                                      label='실험별 평가 결과 비교')
+            eval_refresh = gr.Button('🔄 비교표 새로고침')
+
+            eval_btn.click(cut_evaluate,
+                          inputs=[eval_epoch, eval_exp, eval_notes, eval_eo,
+                                  eval_id_on, eval_real_b, eval_incw,
+                                  eval_fid_max, eval_qual_max, eval_struct_max] + ordered_inputs,
+                          outputs=[eval_log, eval_table])
+            eval_refresh.click(lambda *v: eval_table_rows(_cfg_from_values(v)['results_dir'],
+                                                           _cfg_from_values(v)['name']),
+                               inputs=ordered_inputs, outputs=eval_table)
 
     return demo
 
