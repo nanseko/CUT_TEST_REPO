@@ -34,64 +34,32 @@ from preprocessing.pipeline import (
     _load_gray, _safe_gray01,
 )
 from preprocessing.steps import SPECKLE_METHODS
+from preprocessing.img_metrics import (
+    resize_to as _resize_to, psnr, cc, epi, composite_score, EPS,
+)
+from preprocessing import fid_utils as _fu
 
-EPS = 1e-8
+# re-exported for backward compatibility (gui.py / preprocessing/__init__.py
+# import these names directly from preprocessing.optimize)
+INCEPTION_FILENAME = _fu.INCEPTION_FILENAME
+fid_available = _fu.fid_available
+resolve_inception_weights = _fu.resolve_inception_weights
+fid_from_feats = _fu.fid_from_feats
+_read_rgb_arrays = _fu.read_rgb_arrays
+_features_from_arrays = _fu.features_from_arrays
+
+
+def _load_inception(device='cpu', weights_path=None):
+    return _fu.load_inception(device, weights_path)
+
 
 # order-sensitive steps that get permuted
 PERMUTE_STEPS = ['sar_intensity_transform', 'speckle_filter',
                  'outlier_clipping', 'histogram_mapping']
 
 
-# --------------------------------------------------------------------------- #
-# Image-evaluation metrics (reference = raw SAR, resized to the output size)
-# --------------------------------------------------------------------------- #
-
-def _resize_to(g, shape):
-    from PIL import Image
-    if g.shape == shape:
-        return g
-    im = Image.fromarray((np.clip(g, 0, 1) * 255).astype(np.uint8)).resize(
-        (shape[1], shape[0]), Image.BILINEAR)
-    return np.asarray(im).astype(np.float64) / 255.0
-
-
-def psnr(ref, img):
-    mse = float(np.mean((ref - img) ** 2))
-    if mse <= EPS:
-        return 100.0
-    return float(10.0 * np.log10(1.0 / mse))
-
-
-def cc(ref, img):
-    a = ref.ravel() - ref.mean()
-    b = img.ravel() - img.mean()
-    d = float(np.sqrt((a * a).sum() * (b * b).sum()))
-    return float((a * b).sum() / (d + EPS))
-
-
-def _laplacian(x):
-    xp = np.pad(x, 1, mode='reflect')
-    return (xp[:-2, 1:-1] + xp[2:, 1:-1] + xp[1:-1, :-2] + xp[1:-1, 2:] - 4 * x)
-
-
-def epi(ref, img):
-    """Edge Preservation Index: Pearson correlation of the Laplacians (high-pass)
-    of reference and processed image. ~1 = edges well preserved."""
-    lr = _laplacian(ref).ravel()
-    li = _laplacian(img).ravel()
-    lr = lr - lr.mean()
-    li = li - li.mean()
-    d = float(np.sqrt((lr * lr).sum() * (li * li).sum()))
-    return float((lr * li).sum() / (d + EPS))
-
-
 METRIC_DIRECTION = {'psnr': 1, 'cc': 1, 'epi': 1, 'enl': 1,
                     'speckle_index': -1, 'fid': -1, 'composite': 1}
-
-
-def composite_score(m):
-    """Higher = better. Combines edge preservation, correlation and PSNR."""
-    return (m.get('epi', 0.0) + m.get('cc', 0.0) + m.get('psnr', 0.0) / 40.0) / 3.0
 
 
 # --------------------------------------------------------------------------- #
@@ -199,117 +167,10 @@ def evaluate_pipeline(order, speckle_method, files, image_size=256, hist_mode='s
 
 
 # --------------------------------------------------------------------------- #
-# Optional FID (preprocessed SAR set vs Optical set)
+# Optional FID (preprocessed SAR set vs Optical set) — FID/KID mechanics live in
+# preprocessing/fid_utils.py (shared with evaluation/); this just supplies the
+# per-candidate preprocessed-output image stream.
 # --------------------------------------------------------------------------- #
-
-def fid_available():
-    try:
-        import torch  # noqa
-        import torchvision  # noqa
-        return True
-    except Exception:
-        return False
-
-
-INCEPTION_FILENAME = 'inception_v3_google-0cc3c7bd.pth'
-
-
-def _default_weights_paths():
-    """Local locations searched for the InceptionV3 weights (offline support)."""
-    paths = []
-    env = os.environ.get('INCEPTION_WEIGHTS')
-    if env:
-        paths.append(env)
-    here = os.path.dirname(os.path.abspath(__file__))
-    repo = os.path.dirname(here)
-    for base in ('.', './weights', './models', here, repo,
-                 os.path.join(repo, 'weights'), os.path.join(repo, 'models')):
-        paths.append(os.path.join(base, INCEPTION_FILENAME))
-    return paths
-
-
-def resolve_inception_weights(explicit=None):
-    """Return a local weights path if found (explicit -> env -> common dirs), else None."""
-    for p in ([explicit] if explicit else []) + _default_weights_paths():
-        if p and os.path.exists(p):
-            return p
-    return None
-
-
-def _load_inception(device='cpu', weights_path=None):
-    import torch
-    import torchvision.transforms as T
-    from torchvision.models import inception_v3, Inception_V3_Weights
-    wp = resolve_inception_weights(weights_path)
-    if wp:
-        # offline: build without downloading, then load local weights
-        try:
-            net = inception_v3(weights=None, init_weights=False)
-        except TypeError:
-            net = inception_v3(weights=None)
-        sd = torch.load(wp, map_location=device)
-        try:
-            net.load_state_dict(sd)
-        except Exception:
-            net.load_state_dict(sd, strict=False)
-    else:
-        # online: torchvision uses its cache or downloads once
-        net = inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1)
-    net.fc = torch.nn.Identity()      # 2048-d pool features
-    net.eval().to(device)
-    tf = T.Compose([T.ToPILImage(), T.Resize((299, 299)), T.ToTensor(),
-                    T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
-    return net, tf
-
-
-def _features_from_arrays(array_iter, net, tf, device='cpu', batch=16):
-    import torch
-    feats, buf = [], []
-    with torch.no_grad():
-        for im in array_iter:
-            if im is None:
-                continue
-            if im.ndim == 2:
-                im = np.stack([im] * 3, -1)
-            buf.append(tf(im.astype(np.uint8)))
-            if len(buf) == batch:
-                feats.append(net(torch.stack(buf).to(device)).cpu().numpy())
-                buf = []
-        if buf:
-            feats.append(net(torch.stack(buf).to(device)).cpu().numpy())
-    return np.concatenate(feats, 0) if feats else np.zeros((0, 2048))
-
-
-def _sqrtm_trace(s1, s2):
-    """trace(sqrtm(s1 @ s2)) for symmetric PSD s1, s2 using only numpy (eigh)."""
-    w, v = np.linalg.eigh(s1)
-    w = np.clip(w, 0, None)
-    s1_half = (v * np.sqrt(w)) @ v.T
-    m = s1_half @ s2 @ s1_half
-    ev = np.clip(np.linalg.eigvalsh(m), 0, None)
-    return float(np.sqrt(ev).sum())
-
-
-def fid_from_feats(fa, fb):
-    """Fréchet Inception Distance between two feature sets (numpy-only)."""
-    if fa.shape[0] < 2 or fb.shape[0] < 2:
-        return float('nan')
-    mu1, mu2 = fa.mean(0), fb.mean(0)
-    sa = np.cov(fa, rowvar=False)
-    sb = np.cov(fb, rowvar=False)
-    return float(((mu1 - mu2) ** 2).sum() + np.trace(sa) + np.trace(sb)
-                 - 2.0 * _sqrtm_trace(sa, sb))
-
-
-def _read_rgb_arrays(files):
-    """Yield each image as an RGB uint8 numpy array (for FID feature extraction)."""
-    from PIL import Image
-    for p in files:
-        try:
-            yield np.asarray(Image.open(p).convert('RGB'))
-        except Exception:
-            continue
-
 
 def _pipeline_output_arrays(order, speckle_method, files, hist_mode, optical_target):
     """Yield the final preprocessed uint8 3ch image for each file (for FID)."""

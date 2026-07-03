@@ -3,7 +3,10 @@ import torch
 from .base_model import BaseModel
 from . import networks
 from .patchnce import PatchNCELoss
-from .losses_extra import gradient_loss, laplacian_loss, color_moment_loss
+from .losses_extra import (
+    gradient_loss, laplacian_loss, color_moment_loss, coherence_loss,
+    reflector_saliency_weights_for_shapes,
+)
 import util.util as util
 
 
@@ -44,6 +47,21 @@ class CUTModel(BaseModel):
                             help='do not blur real_A before the structure (gradient/Laplacian) loss; sharper edge targets')
         parser.add_argument('--lambda_color', type=float, default=0.0,
                             help='weight for the colour-moment consistency loss on the identity path idt_B vs real_B (0 = off, needs nce_idt)')
+        parser.add_argument('--reflector_weighted', action='store_true',
+                            help='weight lambda_grad/lambda_lap by a strong-reflector saliency map (real_A), '
+                                 'so small bright objects (ships/vehicles/building corners) get proportionally '
+                                 'more supervision than their pixel count would otherwise give them')
+        parser.add_argument('--saliency_patch_sampling', action='store_true',
+                            help='bias PatchNCE patch sampling toward the same reflector-saliency map instead of '
+                                 'uniform-random, so small objects are sampled (and thus preserved) more often')
+        parser.add_argument('--reflector_boost', type=float, default=3.0,
+                            help='strength of the reflector-saliency weighting used by --reflector_weighted and '
+                                 '--saliency_patch_sampling (weight range is [1, 1+reflector_boost]; 0 = no effect)')
+        parser.add_argument('--lambda_coherence', type=float, default=0.0,
+                            help='weight for the structure-tensor coherence loss: discourages fake_B from turning '
+                                 'small strong-reflector regions (candidate ships/vehicles/buildings) into soft, '
+                                 'isotropic blobs ("clouds"), by rewarding crisp locally-straight edges there '
+                                 '(0 = off). Does NOT force exact right angles; see docs/SMALL_OBJECT_PRESERVATION.md')
 
         parser.set_defaults(pool_size=0)  # no image pooling
 
@@ -80,6 +98,8 @@ class CUTModel(BaseModel):
             self.loss_names += ['G_grad']
         if self.isTrain and getattr(opt, 'lambda_lap', 0.0) > 0.0:
             self.loss_names += ['G_lap']
+        if self.isTrain and getattr(opt, 'lambda_coherence', 0.0) > 0.0:
+            self.loss_names += ['G_coherence']
         if self.isTrain and getattr(opt, 'lambda_color', 0.0) > 0.0 and opt.nce_idt:
             self.loss_names += ['G_color']
 
@@ -248,12 +268,20 @@ class CUTModel(BaseModel):
 
         # optional structure / colour regularisation (ported from the TF CUT fork)
         blur = not getattr(self.opt, 'grad_no_blur', False)
+        refl_w = getattr(self.opt, 'reflector_weighted', False)
+        refl_boost = getattr(self.opt, 'reflector_boost', 3.0)
         if getattr(self.opt, 'lambda_grad', 0.0) > 0.0:
-            self.loss_G_grad = gradient_loss(self.real_A, self.fake_B, blur=blur) * self.opt.lambda_grad
+            self.loss_G_grad = gradient_loss(self.real_A, self.fake_B, blur=blur,
+                                             weighted=refl_w, boost=refl_boost) * self.opt.lambda_grad
             self.loss_G = self.loss_G + self.loss_G_grad
         if getattr(self.opt, 'lambda_lap', 0.0) > 0.0:
-            self.loss_G_lap = laplacian_loss(self.real_A, self.fake_B, blur=blur) * self.opt.lambda_lap
+            self.loss_G_lap = laplacian_loss(self.real_A, self.fake_B, blur=blur,
+                                             weighted=refl_w, boost=refl_boost) * self.opt.lambda_lap
             self.loss_G = self.loss_G + self.loss_G_lap
+        if getattr(self.opt, 'lambda_coherence', 0.0) > 0.0:
+            self.loss_G_coherence = coherence_loss(self.real_A, self.fake_B,
+                                                    boost=refl_boost) * self.opt.lambda_coherence
+            self.loss_G = self.loss_G + self.loss_G_coherence
         if getattr(self.opt, 'lambda_color', 0.0) > 0.0 and self.opt.nce_idt:
             self.loss_G_color = color_moment_loss(self.idt_B, self.real_B) * self.opt.lambda_color
             self.loss_G = self.loss_G + self.loss_G_color
@@ -268,7 +296,15 @@ class CUTModel(BaseModel):
             feat_q = [torch.flip(fq, [3]) for fq in feat_q]
 
         feat_k = self.netG(src, self.nce_layers, encode_only=True)
-        feat_k_pool, sample_ids = self.netF(feat_k, self.opt.num_patches, None)
+        weights = None
+        if getattr(self.opt, 'saliency_patch_sampling', False):
+            # bias which patches get sampled (from src) toward small bright
+            # objects, so PatchNCE actually supervises them instead of mostly
+            # sampling the dominant background texture
+            shapes = [(f.shape[-2], f.shape[-1]) for f in feat_k]
+            weights = reflector_saliency_weights_for_shapes(
+                src, shapes, boost=getattr(self.opt, 'reflector_boost', 3.0))
+        feat_k_pool, sample_ids = self.netF(feat_k, self.opt.num_patches, None, weights)
         feat_q_pool, _ = self.netF(feat_q, self.opt.num_patches, sample_ids)
 
         total_nce_loss = 0.0

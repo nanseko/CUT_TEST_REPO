@@ -65,7 +65,7 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 # up to date (printed on launch and shown in the UI header). If the version you
 # see in the browser/console does not match the latest, you are running an old
 # copy and must replace gui.py / preprocessing/.
-BUILD = '2026-06-30.7 (offline-FID-weights+order-search)'
+BUILD = '2026-07-03.3 (hparam-auto-search+coherence+rectify)'
 
 
 # --------------------------------------------------------------------------- #
@@ -73,6 +73,18 @@ BUILD = '2026-06-30.7 (offline-FID-weights+order-search)'
 # --------------------------------------------------------------------------- #
 
 DEFAULT_CONFIG_PATH = './gui_config.json'
+
+# kept as a literal (not imported from evaluation.EVAL_CSV_COLUMNS) so the GUI
+# module can build its layout even if evaluation/ is temporarily mismatched;
+# must stay in sync with evaluation/evaluate.py's EVAL_CSV_COLUMNS.
+EVAL_TABLE_HEADERS = [
+    'timestamp', 'experiment', 'checkpoint_epoch', 'n_fake', 'n_eo',
+    'fid', 'kid', 'struct_epi', 'struct_cc', 'struct_psnr', 'n_struct_pairs',
+    'idt_psnr', 'idt_ssim', 'n_idt_pairs',
+    'quality_mean', 'quality_std', 'quality_speckle_index', 'quality_enl',
+    'quality_avg_gradient', 'quality_entropy',
+    'notes',
+]
 
 # Stable key order. The Gradio input list is assembled in exactly this order so
 # every Save / Start button can collect the whole config consistently.
@@ -87,6 +99,7 @@ CONFIG_KEYS = [
     'netG', 'normG', 'gan_mode', 'netF', 'netF_nc', 'num_patches', 'nce_T',
     'nce_layers', 'lambda_GAN', 'lambda_NCE', 'nce_idt',
     'no_antialias', 'no_antialias_up', 'lambda_grad', 'lambda_lap', 'grad_no_blur',
+    'reflector_weighted', 'saliency_patch_sampling', 'reflector_boost', 'lambda_coherence',
     'lambda_color', 'serial_batches',
     # 5. Attention params
     'attention_type', 'attention_reduction',
@@ -130,6 +143,10 @@ DEFAULTS = {
     'lambda_grad': 0.0,
     'lambda_lap': 0.0,
     'grad_no_blur': False,
+    'reflector_weighted': False,
+    'saliency_patch_sampling': False,
+    'reflector_boost': 3.0,
+    'lambda_coherence': 0.0,
     'lambda_color': 0.0,
     'serial_batches': False,
     'attention_type': 'none',
@@ -391,6 +408,8 @@ def build_train_cmd(cfg):
            '--nce_idt', 'True' if _bool(cfg['nce_idt']) else 'False',
            '--lambda_grad', str(float(cfg['lambda_grad'])),
            '--lambda_lap', str(float(cfg.get('lambda_lap', 0.0))),
+           '--reflector_boost', str(float(cfg.get('reflector_boost', 3.0))),
+           '--lambda_coherence', str(float(cfg.get('lambda_coherence', 0.0))),
            '--lambda_color', str(float(cfg['lambda_color'])),
            '--display_id', '0']    # disable visdom; we stream the console log
     if str(cfg['netG']) == 'hrnet':
@@ -402,6 +421,10 @@ def build_train_cmd(cfg):
         cmd += ['--max_dataset_size', str(int(cfg['max_dataset_size']))]
     if _bool(cfg.get('grad_no_blur')):
         cmd.append('--grad_no_blur')
+    if _bool(cfg.get('reflector_weighted')):
+        cmd.append('--reflector_weighted')
+    if _bool(cfg.get('saliency_patch_sampling')):
+        cmd.append('--saliency_patch_sampling')
     if _bool(cfg.get('serial_batches')):
         # pair real_A[i] with real_B[i] by sorted order (for aligned SAR/optical
         # sets); default CUT samples real_B randomly (unpaired, by design).
@@ -619,6 +642,110 @@ def run_inference(num_test, epoch, *cfg_values):
                    f'\n\n(결과 이미지를 찾지 못했습니다: {out_dir})', gallery)
     except Exception:
         yield ('추론 중 예외 발생:\n' + traceback.format_exc(), gallery)
+
+
+def cut_rectify(epoch, min_area, max_area_frac, min_rectangularity, *cfg_values):
+    """Deterministic post-processing: snap candidate rigid-object regions in
+    fake_B to straight-sided rectangles/polygons (classical CV, guarantees
+    exact geometry — unlike the learned coherence_loss). Reads fake_B from the
+    same test_<epoch> output as '7. 추론/테스트' / '8. 모델 평가'."""
+    cfg = _cfg_from_values(cfg_values)
+    fake_dir = os.path.join(str(cfg['results_dir']), str(cfg['name']), f'test_{epoch}', 'images', 'fake_B')
+    if not os.path.isdir(fake_dir):
+        return f'오류: fake_B 폴더가 없습니다: {fake_dir}\n먼저 "7. 추론/테스트" 를 실행하세요.', []
+    out_dir = os.path.join(str(cfg['results_dir']), str(cfg['name']), f'test_{epoch}', 'rectified')
+    try:
+        import evaluation as EV
+        csv_path, n = EV.rectify_folder(
+            fake_dir, out_dir, min_area=float(min_area or 16),
+            max_area_frac=float(max_area_frac or 0.25),
+            min_rectangularity=float(min_rectangularity or 0.85))
+        gallery = list_images(out_dir)
+        return (f'✅ 완료: 사각형 {n}개 검출 → {out_dir}\n좌표/크기: {csv_path}', gallery[:24])
+    except ImportError as exc:
+        return f'오류: {exc}', []
+    except Exception:
+        return '후처리 중 예외:\n' + traceback.format_exc(), []
+
+
+HPS_APPLY_KEYS = ['attention_type', 'attention_reduction', 'attention_encoder',
+                  'attention_resblocks', 'attention_decoder', 'lambda_grad',
+                  'lambda_lap', 'lambda_coherence', 'lambda_color',
+                  'reflector_weighted', 'saliency_patch_sampling', 'reflector_boost']
+
+
+def cut_hparam_search(out_dir, n_trials, s1_epochs, s2_epochs, top_k, s1_images,
+                      s2_images, num_test, primary, eo_dir, incw, *cfg_values):
+    """One-button Successive-Halving hyperparameter search over attention +
+    structure/hallucination loss weights. Short trainings ranked by FID/EPI;
+    winners get more budget via continue_train. Resumable (hparam_results.csv)."""
+    cfg = _cfg_from_values(cfg_values)
+    try:
+        from evaluation.hparam_search import hparam_search
+        for line in hparam_search(
+                cfg, build_train_cmd, build_test_cmd,
+                out_dir or './hparam_search',
+                n_trials=int(n_trials or 12), stage1_epochs=int(s1_epochs or 15),
+                stage2_epochs=int(s2_epochs or 45), top_k=int(top_k or 3),
+                stage1_images=int(s1_images or 300), stage2_images=int(s2_images or 0),
+                num_test=int(num_test or 100), primary=primary,
+                eo_dir=(eo_dir or None), inception_weights=(incw or None),
+                repo_root=REPO_ROOT):
+            yield line
+    except Exception:
+        yield '하이퍼파라미터 탐색 중 예외:\n' + traceback.format_exc()
+
+
+def hps_apply_best(out_dir):
+    """Load best_hparams.json and return updates for the Tab-4/5 widgets."""
+    try:
+        from evaluation.hparam_search import load_best
+        best = load_best(out_dir or './hparam_search')
+    except Exception:
+        best = None
+    if not best:
+        return ['best_hparams.json 을 찾을 수 없습니다 — 먼저 탐색을 실행하세요.'] + \
+               [gr.update() for _ in HPS_APPLY_KEYS]
+    ov = best.get('overrides', {})
+    msg = (f'✅ 최적 설정을 탭 4/5에 적용했습니다 ({best.get("primary")}='
+           f'{(best.get("metrics") or {}).get(best.get("primary"))}). '
+           f'"💾 저장" 후 학습을 시작하세요.\n'
+           + json.dumps(ov, sort_keys=True, ensure_ascii=False))
+    return [msg] + [gr.update(value=ov[k]) if k in ov else gr.update()
+                    for k in HPS_APPLY_KEYS]
+
+
+def eval_table_rows(results_dir, name):
+    """Read the logged evaluation rows for the GUI comparison table."""
+    import evaluation as EV
+    rows = EV.load_eval_log(results_dir, name)
+    return [[r.get(c, '') for c in EV.EVAL_CSV_COLUMNS] for r in rows]
+
+
+def cut_evaluate(epoch, experiment, notes, eo_dir, compute_identity, real_b_dir,
+                 inception_weights, fid_max, quality_max, struct_max, *cfg_values):
+    """One-button CUT output evaluation (FID/KID vs EO, structure vs real_A,
+    optional identity-path vs G(real_B), no-reference quality). Reads outputs
+    already produced by '7. 추론/테스트' (test.py) and logs a comparison row
+    under <results_dir>/<name>/eval_logs/eval_results.csv."""
+    import evaluation as EV
+    cfg = _cfg_from_values(cfg_values)
+    epoch = (epoch or 'latest').strip() or 'latest'
+    try:
+        last = ''
+        for line in EV.run_evaluation(
+                results_dir=cfg['results_dir'], name=cfg['name'], epoch=epoch,
+                experiment=(experiment or cfg['name']), notes=notes,
+                eo_dir=(eo_dir or None), checkpoints_dir=cfg['checkpoints_dir'], cfg=cfg,
+                compute_identity=bool(compute_identity), real_b_dir=(real_b_dir or None),
+                inception_weights=(inception_weights or None),
+                fid_max=int(fid_max or 500), quality_max=int(quality_max or 0),
+                struct_max=int(struct_max or 0)):
+            last = line
+            yield last, eval_table_rows(cfg['results_dir'], cfg['name'])
+    except Exception:
+        yield ('평가 중 예외:\n' + traceback.format_exc(),
+              eval_table_rows(cfg['results_dir'], cfg['name']))
 
 
 # --------------------------------------------------------------------------- #
@@ -1575,6 +1702,26 @@ def build_ui():
             gr.Markdown(
                 'ℹ️ 강반사체 주변 블러가 심하면: `netG=hrnet` + `lambda_grad`(예 1.0) + `lambda_lap`(예 0.5) + '
                 '`grad_no_blur` 체크를 함께 써보세요. 너무 강하면 결과가 SAR처럼 밋밋해질 수 있으니 값으로 조절하세요.')
+            gr.Markdown(
+                '**소형 물체(요트·탱크·건물 등) 형상 보존** — 균일 평균 손실/균일 패치샘플링은 이미지의 '
+                '극히 일부만 차지하는 강반사체(금속 물체) 를 거의 감독하지 못해 구름·블롭으로 뭉개지기 쉽습니다. '
+                '아래 두 옵션은 SAR 입력의 국소 밝기 피크(강반사체=물체 후보)에 가중치를 줘서 이 문제를 직접 완화합니다.')
+            with gr.Row():
+                comp['reflector_weighted'] = gr.Checkbox(
+                    bool(cfg['reflector_weighted']),
+                    label='reflector_weighted (lambda_grad/lambda_lap을 강반사체 위치에서 더 강하게)')
+                comp['saliency_patch_sampling'] = gr.Checkbox(
+                    bool(cfg['saliency_patch_sampling']),
+                    label='saliency_patch_sampling (PatchNCE 패치 샘플링을 강반사체 쪽으로 편향)')
+                comp['reflector_boost'] = gr.Number(
+                    cfg['reflector_boost'], label='reflector_boost (가중 강도, 0=끔)')
+            comp['lambda_coherence'] = gr.Number(
+                cfg['lambda_coherence'],
+                label='lambda_coherence (강반사체 위치를 "구름형 블롭" 대신 "직선 에지"로 유도, 0=끔)')
+            gr.Markdown(
+                'ℹ️ `lambda_coherence` 는 구조텐서 기반으로 강반사체 위치의 출력이 등방성 블롭(구름처럼 뭉개짐) '
+                '대신 국소적으로 뚜렷한 직선 에지를 갖도록 유도합니다. **90도 직각을 보장하지는 않습니다** '
+                '— 자세한 원리와 한계는 docs/SMALL_OBJECT_PRESERVATION.md 참고. 0.3~1.0 부터 시작해보세요.')
             with gr.Row():
                 comp['no_antialias'] = gr.Checkbox(bool(cfg['no_antialias']), label='no_antialias (다운샘플 stride2)')
                 comp['no_antialias_up'] = gr.Checkbox(bool(cfg['no_antialias_up']), label='no_antialias_up')
@@ -1668,6 +1815,111 @@ def build_ui():
             inf_btn.click(run_inference,
                           inputs=[inf_num, inf_epoch] + ordered_inputs,
                           outputs=[inf_status, inf_gallery])
+
+        # ---- Tab 8 : Model evaluation (CUT outputs) --------------------- #
+        with gr.Tab('8. 모델 평가 (CUT 출력)'):
+            gr.Markdown(
+                '**"7. 추론/테스트"로 생성된 결과**(`results_dir/name/test_<epoch>/images/{fake_B,real_A,real_B}`)'
+                ' 를 평가합니다. 백본(ResNet/HRNet)·attention·lambda 값을 바꿀 때마다 **실험명**을 다르게 주고 '
+                '실행하면 아래 비교표에 누적되어 설정 간 비교가 됩니다.\n\n'
+                '- **FID / KID** (↓ 낮을수록 좋음): fake_B ↔ EO 참조 세트. SAR→EO 도메인 근접도(핵심 지표).\n'
+                '- **EPI / CC / PSNR** (↑): real_A ↔ fake_B. 구조·에지 보존(허상 가드레일).\n'
+                '- **idt PSNR / SSIM** (↑): real_B ↔ idt_B=G(real_B) — 짝 데이터라 정확한 비교. 백본 변경 시 유용.\n'
+                '- **품질 지표**: fake_B 단독(선명도·대비·정보량), 무참조.')
+            with gr.Row():
+                eval_epoch = gr.Textbox('latest', label='epoch (테스트에 사용한 값과 동일하게)')
+                eval_exp = gr.Textbox('', label='실험명 (비워두면 name 사용, 예: hrnet_coord_lgrad1.0)')
+            eval_notes = gr.Textbox('', label='메모 (선택)')
+            with gr.Row():
+                eval_eo = gr.Textbox('./datasets/Optical/trainB', label='EO(광학) 참조 폴더 (FID/KID 기준)')
+                eval_incw = gr.Textbox('', label='InceptionV3 가중치 .pth 경로 (오프라인용, 비우면 자동탐색)')
+            with gr.Row():
+                eval_id_on = gr.Checkbox(True, label='Identity 평가(idt_B 생성, 탭4/5 설정과 동일한 체크포인트 사용)')
+                eval_real_b = gr.Textbox('', label='real_B 폴더 (비우면 test 결과의 real_B 자동 사용)')
+            with gr.Row():
+                eval_fid_max = gr.Number(500, label='FID/KID 평가 장수', precision=0)
+                eval_struct_max = gr.Number(0, label='구조 평가 장수 (0=전체)', precision=0)
+                eval_qual_max = gr.Number(0, label='품질 평가 장수 (0=전체)', precision=0)
+            eval_btn = gr.Button('▶ 평가 실행', variant='primary')
+            eval_log = gr.Textbox(label='평가 진행/결과 로그', lines=14, interactive=False, max_lines=14)
+            gr.Markdown('**실험 비교표** (실행할 때마다 누적, `eval_results.csv`)')
+            eval_table = gr.Dataframe(headers=EVAL_TABLE_HEADERS, wrap=True,
+                                      label='실험별 평가 결과 비교')
+            eval_refresh = gr.Button('🔄 비교표 새로고침')
+
+            eval_btn.click(cut_evaluate,
+                          inputs=[eval_epoch, eval_exp, eval_notes, eval_eo,
+                                  eval_id_on, eval_real_b, eval_incw,
+                                  eval_fid_max, eval_qual_max, eval_struct_max] + ordered_inputs,
+                          outputs=[eval_log, eval_table])
+            eval_refresh.click(lambda *v: eval_table_rows(_cfg_from_values(v)['results_dir'],
+                                                           _cfg_from_values(v)['name']),
+                               inputs=ordered_inputs, outputs=eval_table)
+
+        # ---- Tab 9 : Deterministic rectification (post-processing) ------ #
+        with gr.Tab('9. 형상 후처리 (직사각 스냅)'):
+            gr.Markdown(
+                '**결정론적 후처리** — `fake_B`에서 강체 물체 후보 영역을 검출해 최소외접회전사각형'
+                '(`cv2.minAreaRect`)/단순화 다각형으로 스냅합니다. 학습된 `lambda_coherence`(탭 4)와 달리 '
+                '**90도 직각을 기하학적으로 보장**하지만, 사실적인 텍스처가 아니라 벡터 도형처럼 보입니다. '
+                '사진 같은 결과가 아니라 **형상 추출/판독**(건물 footprint, 선박 크기·방위)이 목적일 때 사용하세요.\n\n'
+                '- 원형/불규칙 블롭(원형도가 낮은 객체)은 자동으로 제외됩니다 (사각형이 아닌 걸 억지로 사각형화하지 않음).')
+            with gr.Row():
+                rect_epoch = gr.Textbox('latest', label='epoch (테스트에 사용한 값과 동일하게)')
+            with gr.Row():
+                rect_min_area = gr.Number(16, label='최소 영역 크기 (px², 노이즈 제거)')
+                rect_max_frac = gr.Number(0.25, label='최대 영역 비율 (이미지 대비, 배경 제외)')
+                rect_min_rectangularity = gr.Number(
+                    0.85, label='최소 사각형도 (0~1, 원은 이론상 최대 0.785)')
+            rect_btn = gr.Button('▶ 형상 후처리 실행', variant='primary')
+            rect_status = gr.Textbox(label='결과', lines=4, interactive=False)
+            rect_gallery = gr.Gallery(label='검출된 사각형 오버레이 (초록=사각형, 빨강=단순화 다각형)',
+                                      columns=4, height='auto')
+            rect_btn.click(cut_rectify,
+                          inputs=[rect_epoch, rect_min_area, rect_max_frac, rect_min_rectangularity]
+                                 + ordered_inputs,
+                          outputs=[rect_status, rect_gallery])
+
+        # ---- Tab 10 : Hyperparameter auto-search (Successive Halving) --- #
+        with gr.Tab('10. 하이퍼파라미터 자동 탐색'):
+            gr.Markdown(
+                '**Attention(type/위치/reduction) + 구조/허상 손실 가중치**(lambda_grad/lap/coherence/color, '
+                'reflector_boost, 가중/샘플링 옵션)를 자동으로 탐색합니다.\n\n'
+                '**방식 (Successive Halving)** — GAN 학습 손실은 품질 지표가 아니므로, 짧은 학습 N개를 돌려 '
+                '**FID(EO 대비)·EPI** 로 랭킹하고, 상위 K개만 **이어학습**으로 예산을 더 줘 재평가합니다.\n'
+                '- 탭 1~5의 현재 설정(dataroot/netG/crop 등)이 **기본값**이 되고, 탐색 대상 파라미터만 trial마다 바뀝니다.\n'
+                '- **중단해도 재개 가능**: 완료된 trial은 `hparam_results.csv` 에 기록되어 다시 학습하지 않습니다.\n'
+                '- 예상 시간: trial당 대략 (stage1 장수 × epoch) 학습 + 추론/평가. RTX 5080 기준 '
+                '300장×15ep ≈ 수 분/trial → 12 trial이면 한나절~하룻밤 수준.')
+            with gr.Row():
+                hps_out = gr.Textbox('./hparam_search', label='탐색 결과/로그 폴더')
+                hps_primary = gr.Dropdown(['fid', 'epi'], value='fid',
+                                          label='랭킹 지표 (SAR→EO는 fid 권장, EO 없으면 자동 epi 전환)')
+            with gr.Row():
+                hps_n = gr.Number(12, label='후보 trial 수', precision=0)
+                hps_topk = gr.Number(3, label='stage2 진출 상위 K', precision=0)
+                hps_s1ep = gr.Number(15, label='stage1 epoch', precision=0)
+                hps_s2ep = gr.Number(45, label='stage2 추가 epoch', precision=0)
+            with gr.Row():
+                hps_s1img = gr.Number(300, label='stage1 학습 장수', precision=0)
+                hps_s2img = gr.Number(0, label='stage2 학습 장수 (0=전체)', precision=0)
+                hps_ntest = gr.Number(100, label='평가용 추론 장수 (num_test)', precision=0)
+            with gr.Row():
+                hps_eo = gr.Textbox('./datasets/Optical/trainB', label='EO(광학) 참조 폴더 (FID 기준)')
+                hps_incw = gr.Textbox('', label='InceptionV3 가중치 .pth (오프라인용, 비우면 자동)')
+            hps_btn = gr.Button('🚀 자동 탐색 실행', variant='primary')
+            hps_log = gr.Textbox(label='탐색 진행/결과 로그', lines=18, interactive=False, max_lines=18)
+            with gr.Row():
+                hps_apply_btn = gr.Button('🧬 최적 설정을 탭 4/5에 적용')
+                hps_apply_msg = gr.Textbox(label='적용 결과', lines=3, interactive=False)
+
+            hps_btn.click(cut_hparam_search,
+                          inputs=[hps_out, hps_n, hps_s1ep, hps_s2ep, hps_topk,
+                                  hps_s1img, hps_s2img, hps_ntest, hps_primary,
+                                  hps_eo, hps_incw] + ordered_inputs,
+                          outputs=hps_log)
+            hps_apply_btn.click(hps_apply_best, inputs=[hps_out],
+                                outputs=[hps_apply_msg] + [comp[k] for k in HPS_APPLY_KEYS])
 
     return demo
 
