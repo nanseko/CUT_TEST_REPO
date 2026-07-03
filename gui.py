@@ -65,7 +65,7 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 # up to date (printed on launch and shown in the UI header). If the version you
 # see in the browser/console does not match the latest, you are running an old
 # copy and must replace gui.py / preprocessing/.
-BUILD = '2026-07-03.2 (coherence-loss+rectify-postprocess)'
+BUILD = '2026-07-03.3 (hparam-auto-search+coherence+rectify)'
 
 
 # --------------------------------------------------------------------------- #
@@ -666,6 +666,53 @@ def cut_rectify(epoch, min_area, max_area_frac, min_rectangularity, *cfg_values)
         return f'오류: {exc}', []
     except Exception:
         return '후처리 중 예외:\n' + traceback.format_exc(), []
+
+
+HPS_APPLY_KEYS = ['attention_type', 'attention_reduction', 'attention_encoder',
+                  'attention_resblocks', 'attention_decoder', 'lambda_grad',
+                  'lambda_lap', 'lambda_coherence', 'lambda_color',
+                  'reflector_weighted', 'saliency_patch_sampling', 'reflector_boost']
+
+
+def cut_hparam_search(out_dir, n_trials, s1_epochs, s2_epochs, top_k, s1_images,
+                      s2_images, num_test, primary, eo_dir, incw, *cfg_values):
+    """One-button Successive-Halving hyperparameter search over attention +
+    structure/hallucination loss weights. Short trainings ranked by FID/EPI;
+    winners get more budget via continue_train. Resumable (hparam_results.csv)."""
+    cfg = _cfg_from_values(cfg_values)
+    try:
+        from evaluation.hparam_search import hparam_search
+        for line in hparam_search(
+                cfg, build_train_cmd, build_test_cmd,
+                out_dir or './hparam_search',
+                n_trials=int(n_trials or 12), stage1_epochs=int(s1_epochs or 15),
+                stage2_epochs=int(s2_epochs or 45), top_k=int(top_k or 3),
+                stage1_images=int(s1_images or 300), stage2_images=int(s2_images or 0),
+                num_test=int(num_test or 100), primary=primary,
+                eo_dir=(eo_dir or None), inception_weights=(incw or None),
+                repo_root=REPO_ROOT):
+            yield line
+    except Exception:
+        yield '하이퍼파라미터 탐색 중 예외:\n' + traceback.format_exc()
+
+
+def hps_apply_best(out_dir):
+    """Load best_hparams.json and return updates for the Tab-4/5 widgets."""
+    try:
+        from evaluation.hparam_search import load_best
+        best = load_best(out_dir or './hparam_search')
+    except Exception:
+        best = None
+    if not best:
+        return ['best_hparams.json 을 찾을 수 없습니다 — 먼저 탐색을 실행하세요.'] + \
+               [gr.update() for _ in HPS_APPLY_KEYS]
+    ov = best.get('overrides', {})
+    msg = (f'✅ 최적 설정을 탭 4/5에 적용했습니다 ({best.get("primary")}='
+           f'{(best.get("metrics") or {}).get(best.get("primary"))}). '
+           f'"💾 저장" 후 학습을 시작하세요.\n'
+           + json.dumps(ov, sort_keys=True, ensure_ascii=False))
+    return [msg] + [gr.update(value=ov[k]) if k in ov else gr.update()
+                    for k in HPS_APPLY_KEYS]
 
 
 def eval_table_rows(results_dir, name):
@@ -1832,6 +1879,47 @@ def build_ui():
                           inputs=[rect_epoch, rect_min_area, rect_max_frac, rect_min_rectangularity]
                                  + ordered_inputs,
                           outputs=[rect_status, rect_gallery])
+
+        # ---- Tab 10 : Hyperparameter auto-search (Successive Halving) --- #
+        with gr.Tab('10. 하이퍼파라미터 자동 탐색'):
+            gr.Markdown(
+                '**Attention(type/위치/reduction) + 구조/허상 손실 가중치**(lambda_grad/lap/coherence/color, '
+                'reflector_boost, 가중/샘플링 옵션)를 자동으로 탐색합니다.\n\n'
+                '**방식 (Successive Halving)** — GAN 학습 손실은 품질 지표가 아니므로, 짧은 학습 N개를 돌려 '
+                '**FID(EO 대비)·EPI** 로 랭킹하고, 상위 K개만 **이어학습**으로 예산을 더 줘 재평가합니다.\n'
+                '- 탭 1~5의 현재 설정(dataroot/netG/crop 등)이 **기본값**이 되고, 탐색 대상 파라미터만 trial마다 바뀝니다.\n'
+                '- **중단해도 재개 가능**: 완료된 trial은 `hparam_results.csv` 에 기록되어 다시 학습하지 않습니다.\n'
+                '- 예상 시간: trial당 대략 (stage1 장수 × epoch) 학습 + 추론/평가. RTX 5080 기준 '
+                '300장×15ep ≈ 수 분/trial → 12 trial이면 한나절~하룻밤 수준.')
+            with gr.Row():
+                hps_out = gr.Textbox('./hparam_search', label='탐색 결과/로그 폴더')
+                hps_primary = gr.Dropdown(['fid', 'epi'], value='fid',
+                                          label='랭킹 지표 (SAR→EO는 fid 권장, EO 없으면 자동 epi 전환)')
+            with gr.Row():
+                hps_n = gr.Number(12, label='후보 trial 수', precision=0)
+                hps_topk = gr.Number(3, label='stage2 진출 상위 K', precision=0)
+                hps_s1ep = gr.Number(15, label='stage1 epoch', precision=0)
+                hps_s2ep = gr.Number(45, label='stage2 추가 epoch', precision=0)
+            with gr.Row():
+                hps_s1img = gr.Number(300, label='stage1 학습 장수', precision=0)
+                hps_s2img = gr.Number(0, label='stage2 학습 장수 (0=전체)', precision=0)
+                hps_ntest = gr.Number(100, label='평가용 추론 장수 (num_test)', precision=0)
+            with gr.Row():
+                hps_eo = gr.Textbox('./datasets/Optical/trainB', label='EO(광학) 참조 폴더 (FID 기준)')
+                hps_incw = gr.Textbox('', label='InceptionV3 가중치 .pth (오프라인용, 비우면 자동)')
+            hps_btn = gr.Button('🚀 자동 탐색 실행', variant='primary')
+            hps_log = gr.Textbox(label='탐색 진행/결과 로그', lines=18, interactive=False, max_lines=18)
+            with gr.Row():
+                hps_apply_btn = gr.Button('🧬 최적 설정을 탭 4/5에 적용')
+                hps_apply_msg = gr.Textbox(label='적용 결과', lines=3, interactive=False)
+
+            hps_btn.click(cut_hparam_search,
+                          inputs=[hps_out, hps_n, hps_s1ep, hps_s2ep, hps_topk,
+                                  hps_s1img, hps_s2img, hps_ntest, hps_primary,
+                                  hps_eo, hps_incw] + ordered_inputs,
+                          outputs=hps_log)
+            hps_apply_btn.click(hps_apply_best, inputs=[hps_out],
+                                outputs=[hps_apply_msg] + [comp[k] for k in HPS_APPLY_KEYS])
 
     return demo
 

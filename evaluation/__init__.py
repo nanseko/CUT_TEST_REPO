@@ -38,3 +38,15 @@ try:
     __all__ += ['detect_candidate_regions', 'rectify_regions', 'rectify_image', 'rectify_folder']
 except Exception:
     pass
+
+# Hyperparameter search (Successive Halving over short trainings, ranked by
+# FID/EPI). Defensive import for partially-updated trees.
+try:
+    from evaluation.hparam_search import (
+        hparam_search, sample_trials, canonicalize, trial_sig, load_best,
+        DEFAULT_SPACE,
+    )
+    __all__ += ['hparam_search', 'sample_trials', 'canonicalize', 'trial_sig',
+                'load_best', 'DEFAULT_SPACE']
+except Exception:
+    pass
