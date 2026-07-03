@@ -111,6 +111,94 @@ def laplacian_loss(source, generated, blur=False, weighted=False, boost=3.0):
     return diff.mean()
 
 
+def _structure_tensor_maps(x, window=5):
+    """Structure-tensor decomposition of a (B,1,H,W) luminance map.
+
+    Returns (energy, coherence), both (B,1,H,W):
+      - energy: local squared-gradient magnitude (Jxx+Jyy) — HIGH only where
+        there is a genuinely strong local edge; near-zero on flat/blurred
+        regions. Unbounded (scales with local contrast).
+      - coherence: in [0,1]. ~1 where the local gradients point in ONE
+        dominant direction (locally straight); ~0 where they are isotropic
+        (many directions within the window) OR the region is flat.
+
+    Coherence ALONE is not sufficient to detect "crisp edge vs blurry blob":
+    a smoothly-varying (Gaussian-blurred) blob has a LOW-magnitude but very
+    CONSISTENT local gradient direction (radially outward), so it can score
+    HIGH coherence despite being exactly the soft, undefined shape we want to
+    penalise. `energy` (is there a real edge here at all?) must be combined
+    with `coherence` (is it one straight direction, not noisy/isotropic?) —
+    see `edge_sharpness_map`.
+    """
+    kx = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]],
+                      device=x.device, dtype=x.dtype).view(1, 1, 3, 3)
+    ky = kx.transpose(-1, -2)
+    xp = F.pad(x, (1, 1, 1, 1), mode='reflect')
+    gx = F.conv2d(xp, kx)
+    gy = F.conv2d(xp, ky)
+    jxx = F.avg_pool2d(gx * gx, kernel_size=window, stride=1, padding=window // 2)
+    jyy = F.avg_pool2d(gy * gy, kernel_size=window, stride=1, padding=window // 2)
+    jxy = F.avg_pool2d(gx * gy, kernel_size=window, stride=1, padding=window // 2)
+    energy = jxx + jyy
+    # closed-form eigenvalue gap / sum for the 2x2 symmetric matrix [[jxx,jxy],[jxy,jyy]]
+    num = torch.sqrt((jxx - jyy) ** 2 + 4.0 * jxy ** 2 + 1e-12)
+    coherence = (num / (energy + EPS)).clamp(0, 1)
+    return energy, coherence
+
+
+def edge_sharpness_map(x, window=5, energy_scale=1.0):
+    """(B,1,H,W) map in [0,1]: high ONLY where there is both a strong local
+    gradient (`energy`) AND a single consistent orientation (`coherence`) —
+    i.e. a genuinely crisp, locally-straight edge. Low for flat regions (no
+    energy), soft/blurred blobs (low energy despite high coherence, since a
+    smooth radial gradient still points in one consistent direction), and
+    noisy/isotropic texture (energy present but low coherence).
+
+    ``energy`` is saturated against a FIXED absolute scale (``energy_scale``),
+    NOT the image's own max/percentile: per-image-relative normalisation would
+    make even a faint blurred edge read as "maximally sharp" relative to
+    itself, exactly hiding the weak-vs-strong distinction this function exists
+    to make. ``energy_scale`` is calibrated in the same units as
+    ``_structure_tensor_maps`` on [0,1] luminance (Sobel-based); a full-
+    contrast step edge has energy of order 5-10, so the default 1.0 already
+    strongly discriminates a crisp edge from a softly blurred one.
+
+    NOTE: a true 90-degree corner is, by construction, where two straight
+    edges meet — locally that pixel has TWO gradient directions, so coherence
+    (and thus sharpness) is naturally somewhat lower exactly at the corner
+    than along the straight sides. This is an inherent property of any
+    orientation-coherence measure, not a bug; getting corners themselves to
+    read as "sharp" needs a dedicated corner-response term (e.g. a Harris-like
+    det/trace measure), which this function intentionally does not attempt —
+    see docs/SMALL_OBJECT_PRESERVATION.md.
+    """
+    energy, coherence = _structure_tensor_maps(x, window=window)
+    energy_norm = (energy / (energy + energy_scale)).clamp(0, 1)
+    return energy_norm * coherence
+
+
+def coherence_loss(source, generated, boost=3.0, window=5, energy_scale=1.0):
+    """Penalise blob-like ("cloud") appearance of `generated` specifically
+    where `source` (SAR) shows a strong compact reflector (candidate rigid
+    object: ship/vehicle/building corner), by encouraging crisp, locally-
+    straight edges there (`edge_sharpness_map`) instead of either a flat/
+    blurred erasure or a soft isotropic blob. Smooth background (water/
+    terrain) is NOT pushed toward artificial edges, because the weight (from
+    `source`'s saliency map) is low there.
+
+    This does not force exact right angles (see docs/SMALL_OBJECT_PRESERVATION.md
+    for that harder goal) — it only discourages the smeared/blob-like
+    appearance that replaces small rigid objects.
+
+    Returns a scalar; the caller multiplies by a lambda weight. Lower is
+    better (sharper edges in salient regions).
+    """
+    gg = _luminance(generated)
+    sharpness = edge_sharpness_map(gg, window=window, energy_scale=energy_scale)
+    weight = reflector_saliency_map(source, boost=boost)
+    return ((1.0 - sharpness) * weight).mean()
+
+
 def color_moment_loss(generated, reference):
     """Match per-channel mean/std (identity path: idt_B vs real_B)."""
     g_mean = generated.mean(dim=(2, 3))

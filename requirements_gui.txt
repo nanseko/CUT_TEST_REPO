@@ -6,4 +6,4 @@ pillow
 requests          # M4-SAR dataset download (Colab)
 # optional preprocessing extras:
 # bm3d            # BM3D speckle filter (else falls back to refined_lee)
-# opencv-python   # CLAHE in histogram mapping
+# opencv-python   # CLAHE in histogram mapping + Tab 9 형상 후처리 (직사각 스냅)

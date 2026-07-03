@@ -23,7 +23,7 @@ import numpy as np
 from models.attention import CBAM, CoordinateAttention, make_attention
 from models.networks import ResnetGenerator, HRNetGenerator, PatchSampleF
 from models.losses_extra import (
-    gradient_loss, laplacian_loss, color_moment_loss,
+    gradient_loss, laplacian_loss, color_moment_loss, coherence_loss,
     reflector_saliency_map, reflector_saliency_weights_for_shapes,
 )
 
@@ -109,6 +109,56 @@ def test_reflector_saliency():
           f'| lap_loss unweighted={ll_u.item():.4f} weighted={ll_w.item():.4f}')
 
 
+def test_coherence_loss():
+    """Verify coherence_loss physically ranks crisp edges as better than
+    (progressively) blurred/soft blobs, noisy texture, and erasure -- the
+    "small object turned into a cloud" failure mode."""
+    H = W = 64
+    yy, xx = np.mgrid[0:H, 0:W]
+    square = ((np.abs(yy - H // 2) < 12) & (np.abs(xx - W // 2) < 12)).astype(np.float32)
+
+    def gauss_blur(a, sigma):
+        # tiny separable-box approximation of a Gaussian blur (avoid a scipy dep in tests)
+        k = max(1, int(sigma * 3))
+        t = torch.from_numpy(a)[None, None]
+        for _ in range(3):
+            t = torch.nn.functional.avg_pool2d(
+                torch.nn.functional.pad(t, (k, k, k, k), mode='reflect'),
+                kernel_size=2 * k + 1, stride=1)
+        return t[0, 0].numpy()
+
+    def mk(img01):
+        t = torch.from_numpy(img01.astype(np.float32))[None, None].repeat(1, 3, 1, 1) * 2 - 1
+        return t
+
+    src = mk(square)
+    rng = np.random.RandomState(0)
+    noisy = np.clip(square * (0.5 + 0.5 * rng.randn(H, W)), 0, 1).astype(np.float32)
+    flat = np.zeros((H, W), np.float32)
+    soft_mild = gauss_blur(square, 2)
+    soft_heavy = gauss_blur(square, 4)
+
+    l_crisp = coherence_loss(src, mk(square), boost=3.0).item()
+    l_soft_mild = coherence_loss(src, mk(soft_mild), boost=3.0).item()
+    l_soft_heavy = coherence_loss(src, mk(soft_heavy), boost=3.0).item()
+    l_noisy = coherence_loss(src, mk(noisy), boost=3.0).item()
+    l_flat = coherence_loss(src, mk(flat), boost=3.0).item()
+
+    assert l_crisp < l_soft_mild < l_soft_heavy, (l_crisp, l_soft_mild, l_soft_heavy)
+    assert l_crisp < l_noisy
+    assert l_crisp < l_flat
+    print(f'coherence_loss: OK | crisp={l_crisp:.4f} < soft_mild={l_soft_mild:.4f} '
+          f'< soft_heavy={l_soft_heavy:.4f}; crisp < noisy={l_noisy:.4f}; crisp < flat={l_flat:.4f}')
+
+    # boost=0 must be a no-op-strength call (still runs, weight uniform)
+    a = torch.randn(1, 3, 32, 32).clamp(-1, 1)
+    b = torch.randn(1, 3, 32, 32).clamp(-1, 1).requires_grad_(True)
+    l0 = coherence_loss(a, b, boost=0.0)
+    l0.backward()
+    assert b.grad is not None and torch.isfinite(b.grad).all()
+    print('coherence_loss boost=0 + backward: OK')
+
+
 def test_weighted_patch_sampling():
     torch.manual_seed(0)
     np.random.seed(0)
@@ -146,6 +196,7 @@ def main():
     test_hrnet('coord', attention_encoder=True, attention_resblocks=True)
     test_losses()
     test_reflector_saliency()
+    test_coherence_loss()
     test_weighted_patch_sampling()
     print('\nAll attention-integration smoke tests passed.')
 

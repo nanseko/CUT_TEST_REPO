@@ -28,3 +28,13 @@ __all__ = [
     'compute_domain_metrics', 'compute_structure_metrics', 'compute_identity_metrics',
     'compute_quality_metrics', 'run_evaluation', 'load_eval_log', 'EVAL_CSV_COLUMNS',
 ]
+
+# Optional: rectify.py needs opencv. Import lazily/defensively so the rest of
+# the package still works when opencv isn't installed.
+try:
+    from evaluation.rectify import (
+        detect_candidate_regions, rectify_regions, rectify_image, rectify_folder,
+    )
+    __all__ += ['detect_candidate_regions', 'rectify_regions', 'rectify_image', 'rectify_folder']
+except Exception:
+    pass

@@ -4,7 +4,7 @@ from .base_model import BaseModel
 from . import networks
 from .patchnce import PatchNCELoss
 from .losses_extra import (
-    gradient_loss, laplacian_loss, color_moment_loss,
+    gradient_loss, laplacian_loss, color_moment_loss, coherence_loss,
     reflector_saliency_weights_for_shapes,
 )
 import util.util as util
@@ -57,6 +57,11 @@ class CUTModel(BaseModel):
         parser.add_argument('--reflector_boost', type=float, default=3.0,
                             help='strength of the reflector-saliency weighting used by --reflector_weighted and '
                                  '--saliency_patch_sampling (weight range is [1, 1+reflector_boost]; 0 = no effect)')
+        parser.add_argument('--lambda_coherence', type=float, default=0.0,
+                            help='weight for the structure-tensor coherence loss: discourages fake_B from turning '
+                                 'small strong-reflector regions (candidate ships/vehicles/buildings) into soft, '
+                                 'isotropic blobs ("clouds"), by rewarding crisp locally-straight edges there '
+                                 '(0 = off). Does NOT force exact right angles; see docs/SMALL_OBJECT_PRESERVATION.md')
 
         parser.set_defaults(pool_size=0)  # no image pooling
 
@@ -93,6 +98,8 @@ class CUTModel(BaseModel):
             self.loss_names += ['G_grad']
         if self.isTrain and getattr(opt, 'lambda_lap', 0.0) > 0.0:
             self.loss_names += ['G_lap']
+        if self.isTrain and getattr(opt, 'lambda_coherence', 0.0) > 0.0:
+            self.loss_names += ['G_coherence']
         if self.isTrain and getattr(opt, 'lambda_color', 0.0) > 0.0 and opt.nce_idt:
             self.loss_names += ['G_color']
 
@@ -271,6 +278,10 @@ class CUTModel(BaseModel):
             self.loss_G_lap = laplacian_loss(self.real_A, self.fake_B, blur=blur,
                                              weighted=refl_w, boost=refl_boost) * self.opt.lambda_lap
             self.loss_G = self.loss_G + self.loss_G_lap
+        if getattr(self.opt, 'lambda_coherence', 0.0) > 0.0:
+            self.loss_G_coherence = coherence_loss(self.real_A, self.fake_B,
+                                                    boost=refl_boost) * self.opt.lambda_coherence
+            self.loss_G = self.loss_G + self.loss_G_coherence
         if getattr(self.opt, 'lambda_color', 0.0) > 0.0 and self.opt.nce_idt:
             self.loss_G_color = color_moment_loss(self.idt_B, self.real_B) * self.opt.lambda_color
             self.loss_G = self.loss_G + self.loss_G_color

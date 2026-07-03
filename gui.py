@@ -65,7 +65,7 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 # up to date (printed on launch and shown in the UI header). If the version you
 # see in the browser/console does not match the latest, you are running an old
 # copy and must replace gui.py / preprocessing/.
-BUILD = '2026-07-03.1 (reflector-weighted-loss+saliency-patch-sampling)'
+BUILD = '2026-07-03.2 (coherence-loss+rectify-postprocess)'
 
 
 # --------------------------------------------------------------------------- #
@@ -99,7 +99,7 @@ CONFIG_KEYS = [
     'netG', 'normG', 'gan_mode', 'netF', 'netF_nc', 'num_patches', 'nce_T',
     'nce_layers', 'lambda_GAN', 'lambda_NCE', 'nce_idt',
     'no_antialias', 'no_antialias_up', 'lambda_grad', 'lambda_lap', 'grad_no_blur',
-    'reflector_weighted', 'saliency_patch_sampling', 'reflector_boost',
+    'reflector_weighted', 'saliency_patch_sampling', 'reflector_boost', 'lambda_coherence',
     'lambda_color', 'serial_batches',
     # 5. Attention params
     'attention_type', 'attention_reduction',
@@ -146,6 +146,7 @@ DEFAULTS = {
     'reflector_weighted': False,
     'saliency_patch_sampling': False,
     'reflector_boost': 3.0,
+    'lambda_coherence': 0.0,
     'lambda_color': 0.0,
     'serial_batches': False,
     'attention_type': 'none',
@@ -408,6 +409,7 @@ def build_train_cmd(cfg):
            '--lambda_grad', str(float(cfg['lambda_grad'])),
            '--lambda_lap', str(float(cfg.get('lambda_lap', 0.0))),
            '--reflector_boost', str(float(cfg.get('reflector_boost', 3.0))),
+           '--lambda_coherence', str(float(cfg.get('lambda_coherence', 0.0))),
            '--lambda_color', str(float(cfg['lambda_color'])),
            '--display_id', '0']    # disable visdom; we stream the console log
     if str(cfg['netG']) == 'hrnet':
@@ -640,6 +642,30 @@ def run_inference(num_test, epoch, *cfg_values):
                    f'\n\n(결과 이미지를 찾지 못했습니다: {out_dir})', gallery)
     except Exception:
         yield ('추론 중 예외 발생:\n' + traceback.format_exc(), gallery)
+
+
+def cut_rectify(epoch, min_area, max_area_frac, min_rectangularity, *cfg_values):
+    """Deterministic post-processing: snap candidate rigid-object regions in
+    fake_B to straight-sided rectangles/polygons (classical CV, guarantees
+    exact geometry — unlike the learned coherence_loss). Reads fake_B from the
+    same test_<epoch> output as '7. 추론/테스트' / '8. 모델 평가'."""
+    cfg = _cfg_from_values(cfg_values)
+    fake_dir = os.path.join(str(cfg['results_dir']), str(cfg['name']), f'test_{epoch}', 'images', 'fake_B')
+    if not os.path.isdir(fake_dir):
+        return f'오류: fake_B 폴더가 없습니다: {fake_dir}\n먼저 "7. 추론/테스트" 를 실행하세요.', []
+    out_dir = os.path.join(str(cfg['results_dir']), str(cfg['name']), f'test_{epoch}', 'rectified')
+    try:
+        import evaluation as EV
+        csv_path, n = EV.rectify_folder(
+            fake_dir, out_dir, min_area=float(min_area or 16),
+            max_area_frac=float(max_area_frac or 0.25),
+            min_rectangularity=float(min_rectangularity or 0.85))
+        gallery = list_images(out_dir)
+        return (f'✅ 완료: 사각형 {n}개 검출 → {out_dir}\n좌표/크기: {csv_path}', gallery[:24])
+    except ImportError as exc:
+        return f'오류: {exc}', []
+    except Exception:
+        return '후처리 중 예외:\n' + traceback.format_exc(), []
 
 
 def eval_table_rows(results_dir, name):
@@ -1642,6 +1668,13 @@ def build_ui():
                     label='saliency_patch_sampling (PatchNCE 패치 샘플링을 강반사체 쪽으로 편향)')
                 comp['reflector_boost'] = gr.Number(
                     cfg['reflector_boost'], label='reflector_boost (가중 강도, 0=끔)')
+            comp['lambda_coherence'] = gr.Number(
+                cfg['lambda_coherence'],
+                label='lambda_coherence (강반사체 위치를 "구름형 블롭" 대신 "직선 에지"로 유도, 0=끔)')
+            gr.Markdown(
+                'ℹ️ `lambda_coherence` 는 구조텐서 기반으로 강반사체 위치의 출력이 등방성 블롭(구름처럼 뭉개짐) '
+                '대신 국소적으로 뚜렷한 직선 에지를 갖도록 유도합니다. **90도 직각을 보장하지는 않습니다** '
+                '— 자세한 원리와 한계는 docs/SMALL_OBJECT_PRESERVATION.md 참고. 0.3~1.0 부터 시작해보세요.')
             with gr.Row():
                 comp['no_antialias'] = gr.Checkbox(bool(cfg['no_antialias']), label='no_antialias (다운샘플 stride2)')
                 comp['no_antialias_up'] = gr.Checkbox(bool(cfg['no_antialias_up']), label='no_antialias_up')
@@ -1775,6 +1808,30 @@ def build_ui():
             eval_refresh.click(lambda *v: eval_table_rows(_cfg_from_values(v)['results_dir'],
                                                            _cfg_from_values(v)['name']),
                                inputs=ordered_inputs, outputs=eval_table)
+
+        # ---- Tab 9 : Deterministic rectification (post-processing) ------ #
+        with gr.Tab('9. 형상 후처리 (직사각 스냅)'):
+            gr.Markdown(
+                '**결정론적 후처리** — `fake_B`에서 강체 물체 후보 영역을 검출해 최소외접회전사각형'
+                '(`cv2.minAreaRect`)/단순화 다각형으로 스냅합니다. 학습된 `lambda_coherence`(탭 4)와 달리 '
+                '**90도 직각을 기하학적으로 보장**하지만, 사실적인 텍스처가 아니라 벡터 도형처럼 보입니다. '
+                '사진 같은 결과가 아니라 **형상 추출/판독**(건물 footprint, 선박 크기·방위)이 목적일 때 사용하세요.\n\n'
+                '- 원형/불규칙 블롭(원형도가 낮은 객체)은 자동으로 제외됩니다 (사각형이 아닌 걸 억지로 사각형화하지 않음).')
+            with gr.Row():
+                rect_epoch = gr.Textbox('latest', label='epoch (테스트에 사용한 값과 동일하게)')
+            with gr.Row():
+                rect_min_area = gr.Number(16, label='최소 영역 크기 (px², 노이즈 제거)')
+                rect_max_frac = gr.Number(0.25, label='최대 영역 비율 (이미지 대비, 배경 제외)')
+                rect_min_rectangularity = gr.Number(
+                    0.85, label='최소 사각형도 (0~1, 원은 이론상 최대 0.785)')
+            rect_btn = gr.Button('▶ 형상 후처리 실행', variant='primary')
+            rect_status = gr.Textbox(label='결과', lines=4, interactive=False)
+            rect_gallery = gr.Gallery(label='검출된 사각형 오버레이 (초록=사각형, 빨강=단순화 다각형)',
+                                      columns=4, height='auto')
+            rect_btn.click(cut_rectify,
+                          inputs=[rect_epoch, rect_min_area, rect_max_frac, rect_min_rectangularity]
+                                 + ordered_inputs,
+                          outputs=[rect_status, rect_gallery])
 
     return demo
 
