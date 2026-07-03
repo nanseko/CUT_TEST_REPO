@@ -565,7 +565,13 @@ class PatchSampleF(nn.Module):
         init_net(self, self.init_type, self.init_gain, self.gpu_ids)
         self.mlp_init = True
 
-    def forward(self, feats, num_patches=64, patch_ids=None):
+    def forward(self, feats, num_patches=64, patch_ids=None, weights=None):
+        """``weights``: optional list (one per feat, or None) of 1-D arrays
+        (length H*W, row-major) giving a sampling probability weight per
+        spatial position — used to bias patch sampling toward salient regions
+        (e.g. small bright objects) instead of uniform-random. Only applied
+        when generating NEW patch_ids (patch_ids=None); ignored otherwise so
+        the positive-pair correspondence with a prior call is preserved."""
         return_ids = []
         return_feats = []
         if self.use_mlp and not self.mlp_init:
@@ -577,10 +583,17 @@ class PatchSampleF(nn.Module):
                 if patch_ids is not None:
                     patch_id = patch_ids[feat_id]
                 else:
-                    # torch.randperm produces cudaErrorIllegalAddress for newer versions of PyTorch. https://github.com/taesungp/contrastive-unpaired-translation/issues/83
-                    #patch_id = torch.randperm(feat_reshape.shape[1], device=feats[0].device)
-                    patch_id = np.random.permutation(feat_reshape.shape[1])
-                    patch_id = patch_id[:int(min(num_patches, patch_id.shape[0]))]  # .to(patch_ids.device)
+                    n_total = feat_reshape.shape[1]
+                    n = int(min(num_patches, n_total))
+                    w = weights[feat_id] if weights is not None else None
+                    if w is not None and w.shape[0] == n_total:
+                        # weighted sample without replacement, biased toward
+                        # strong local reflectors (candidate small objects)
+                        patch_id = np.random.choice(n_total, size=n, replace=False, p=w / w.sum())
+                    else:
+                        # torch.randperm produces cudaErrorIllegalAddress for newer versions of PyTorch. https://github.com/taesungp/contrastive-unpaired-translation/issues/83
+                        #patch_id = torch.randperm(feat_reshape.shape[1], device=feats[0].device)
+                        patch_id = np.random.permutation(n_total)[:n]  # .to(patch_ids.device)
                 patch_id = torch.tensor(patch_id, dtype=torch.long, device=feat.device)
                 x_sample = feat_reshape[:, patch_id, :].flatten(0, 1)  # reshape(-1, x.shape[1])
             else:

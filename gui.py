@@ -65,7 +65,7 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 # up to date (printed on launch and shown in the UI header). If the version you
 # see in the browser/console does not match the latest, you are running an old
 # copy and must replace gui.py / preprocessing/.
-BUILD = '2026-07-02.1 (cut-output-evaluation+shared-fid-utils)'
+BUILD = '2026-07-03.1 (reflector-weighted-loss+saliency-patch-sampling)'
 
 
 # --------------------------------------------------------------------------- #
@@ -99,6 +99,7 @@ CONFIG_KEYS = [
     'netG', 'normG', 'gan_mode', 'netF', 'netF_nc', 'num_patches', 'nce_T',
     'nce_layers', 'lambda_GAN', 'lambda_NCE', 'nce_idt',
     'no_antialias', 'no_antialias_up', 'lambda_grad', 'lambda_lap', 'grad_no_blur',
+    'reflector_weighted', 'saliency_patch_sampling', 'reflector_boost',
     'lambda_color', 'serial_batches',
     # 5. Attention params
     'attention_type', 'attention_reduction',
@@ -142,6 +143,9 @@ DEFAULTS = {
     'lambda_grad': 0.0,
     'lambda_lap': 0.0,
     'grad_no_blur': False,
+    'reflector_weighted': False,
+    'saliency_patch_sampling': False,
+    'reflector_boost': 3.0,
     'lambda_color': 0.0,
     'serial_batches': False,
     'attention_type': 'none',
@@ -403,6 +407,7 @@ def build_train_cmd(cfg):
            '--nce_idt', 'True' if _bool(cfg['nce_idt']) else 'False',
            '--lambda_grad', str(float(cfg['lambda_grad'])),
            '--lambda_lap', str(float(cfg.get('lambda_lap', 0.0))),
+           '--reflector_boost', str(float(cfg.get('reflector_boost', 3.0))),
            '--lambda_color', str(float(cfg['lambda_color'])),
            '--display_id', '0']    # disable visdom; we stream the console log
     if str(cfg['netG']) == 'hrnet':
@@ -414,6 +419,10 @@ def build_train_cmd(cfg):
         cmd += ['--max_dataset_size', str(int(cfg['max_dataset_size']))]
     if _bool(cfg.get('grad_no_blur')):
         cmd.append('--grad_no_blur')
+    if _bool(cfg.get('reflector_weighted')):
+        cmd.append('--reflector_weighted')
+    if _bool(cfg.get('saliency_patch_sampling')):
+        cmd.append('--saliency_patch_sampling')
     if _bool(cfg.get('serial_batches')):
         # pair real_A[i] with real_B[i] by sorted order (for aligned SAR/optical
         # sets); default CUT samples real_B randomly (unpaired, by design).
@@ -1620,6 +1629,19 @@ def build_ui():
             gr.Markdown(
                 'ℹ️ 강반사체 주변 블러가 심하면: `netG=hrnet` + `lambda_grad`(예 1.0) + `lambda_lap`(예 0.5) + '
                 '`grad_no_blur` 체크를 함께 써보세요. 너무 강하면 결과가 SAR처럼 밋밋해질 수 있으니 값으로 조절하세요.')
+            gr.Markdown(
+                '**소형 물체(요트·탱크·건물 등) 형상 보존** — 균일 평균 손실/균일 패치샘플링은 이미지의 '
+                '극히 일부만 차지하는 강반사체(금속 물체) 를 거의 감독하지 못해 구름·블롭으로 뭉개지기 쉽습니다. '
+                '아래 두 옵션은 SAR 입력의 국소 밝기 피크(강반사체=물체 후보)에 가중치를 줘서 이 문제를 직접 완화합니다.')
+            with gr.Row():
+                comp['reflector_weighted'] = gr.Checkbox(
+                    bool(cfg['reflector_weighted']),
+                    label='reflector_weighted (lambda_grad/lambda_lap을 강반사체 위치에서 더 강하게)')
+                comp['saliency_patch_sampling'] = gr.Checkbox(
+                    bool(cfg['saliency_patch_sampling']),
+                    label='saliency_patch_sampling (PatchNCE 패치 샘플링을 강반사체 쪽으로 편향)')
+                comp['reflector_boost'] = gr.Number(
+                    cfg['reflector_boost'], label='reflector_boost (가중 강도, 0=끔)')
             with gr.Row():
                 comp['no_antialias'] = gr.Checkbox(bool(cfg['no_antialias']), label='no_antialias (다운샘플 stride2)')
                 comp['no_antialias_up'] = gr.Checkbox(bool(cfg['no_antialias_up']), label='no_antialias_up')
