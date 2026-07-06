@@ -35,6 +35,7 @@ import datetime
 import threading
 import traceback
 import subprocess
+import queue
 
 import gradio as gr
 
@@ -65,7 +66,7 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 # up to date (printed on launch and shown in the UI header). If the version you
 # see in the browser/console does not match the latest, you are running an old
 # copy and must replace gui.py / preprocessing/.
-BUILD = '2026-07-03.3 (hparam-auto-search+coherence+rectify)'
+BUILD = '2026-07-06.1 (training-watchdog+resilience)'
 
 
 # --------------------------------------------------------------------------- #
@@ -244,6 +245,7 @@ class TrainingState:
         self.logs = []
         self.log_file = None
         self.proc = None
+        self.restarts = 0
 
     def log(self, text):
         stamp = datetime.datetime.now().strftime('%H:%M:%S')
@@ -463,55 +465,164 @@ def build_test_cmd(cfg, num_test, epoch):
 
 
 # --------------------------------------------------------------------------- #
-# Training worker (subprocess + live console parsing)
+# Training worker (subprocess + live console parsing + stall watchdog)
+#
+# Long (1-2 day) unattended runs can freeze without the process crashing (a
+# stuck DataLoader worker, a GPU/driver hang, a stalled network-drive read,
+# ...) — "정지되는 것은 아닌데 멈추는" symptom. This is independent of the
+# browser: start_training() spawns this function on a daemon THREAD, so the
+# subprocess keeps running regardless of whether anyone's browser tab / the
+# network to it is connected — only the gui.py process itself needs to stay
+# running (see docs/RESILIENT_TRAINING.md for what that needs at the OS level,
+# e.g. disabling sleep). The watchdog below detects "no forward progress for
+# N minutes" (not just "process exited") and auto-restarts with
+# --continue_train from the last saved checkpoint, so a stall/crash only costs
+# the time since the last checkpoint, not the whole run.
 # --------------------------------------------------------------------------- #
 
-def training_worker(cfg, state):
+# floor for the stall window regardless of the requested stall_minutes, so a
+# mistakenly tiny value can't cause false-positive restarts during normal
+# pauses (checkpoint saving, first-batch data_dependent_initialize, ...).
+# Overridden by tests to verify the watchdog without waiting a full minute+.
+MIN_STALL_SECONDS = 60
+
+
+def _stdout_reader(pipe, q):
     try:
-        cmd = build_train_cmd(cfg)
-        state.log('실행 명령: ' + ' '.join(cmd))
+        for raw in iter(pipe.readline, ''):
+            q.put(raw)
+    except Exception:
+        pass
+    q.put(None)   # EOF sentinel
+
+
+def training_worker(cfg, state, stall_minutes=20, max_restarts=20, backoff_seconds=30):
+    attempt = 0
+    try:
         with state.lock:
             state.total_epochs = int(cfg['n_epochs']) + int(cfg['n_epochs_decay'])
             state.message = '학습 중 (Training)'
-        env = dict(os.environ, PYTHONUNBUFFERED='1')
-        proc = subprocess.Popen(cmd, cwd=REPO_ROOT, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
-        with state.lock:
-            state.proc = proc
+        stall_seconds = max(MIN_STALL_SECONDS, int(float(stall_minutes) * 60))
 
-        for raw in iter(proc.stdout.readline, ''):
-            line = raw.rstrip('\n')
-            if not line:
-                continue
-            m = _RE_ITER.search(line)
-            if m:
-                with state.lock:
-                    state.epoch = int(m.group(1))
-                    state.iters = int(m.group(2))
-                    state.losses = {k: float(v) for k, v in _RE_LOSS.findall(line.split(')', 1)[-1])}
-            ml = _RE_LR.search(line)
-            if ml:
-                with state.lock:
-                    state.lr = float(ml.group(1))
-            state.log(line)
+        while True:
             if state.stop_requested:
-                break
+                state.log('사용자 요청으로 학습 중단됨')
+                with state.lock:
+                    state.message = '중단됨 (Stopped)'
+                return
 
-        if state.stop_requested and proc.poll() is None:
-            proc.terminate()
-            state.log('사용자 요청으로 학습 중단됨')
+            run_cfg = cfg if attempt == 0 else dict(cfg, continue_train=True)
+            cmd = build_train_cmd(run_cfg)
+            tag = '' if attempt == 0 else f' [재시작 {attempt}/{max_restarts}]'
+            state.log(f'실행 명령{tag}: ' + ' '.join(cmd))
+
+            env = dict(os.environ, PYTHONUNBUFFERED='1')
+            proc = subprocess.Popen(cmd, cwd=REPO_ROOT, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
             with state.lock:
-                state.message = '중단됨 (Stopped)'
-        else:
-            ret = proc.wait()
-            if ret == 0:
-                state.log('학습 완료')
+                state.proc = proc
+
+            q = queue.Queue()
+            threading.Thread(target=_stdout_reader, args=(proc.stdout, q), daemon=True).start()
+
+            last_progress = time.time()
+            stalled = False
+            eof = False
+            while True:
+                if state.stop_requested:
+                    proc.terminate()
+                    state.log('사용자 요청으로 학습 중단됨')
+                    with state.lock:
+                        state.message = '중단됨 (Stopped)'
+                    return
+                try:
+                    raw = q.get(timeout=5)
+                except queue.Empty:
+                    raw = ''
+                else:
+                    if raw is None:
+                        eof = True
+                        break
+                    line = raw.rstrip('\n')
+                    if line:
+                        m = _RE_ITER.search(line)
+                        if m:
+                            with state.lock:
+                                state.epoch = int(m.group(1))
+                                state.iters = int(m.group(2))
+                                state.losses = {k: float(v) for k, v in
+                                                _RE_LOSS.findall(line.split(')', 1)[-1])}
+                            last_progress = time.time()
+                        elif 'End of epoch' in line:
+                            last_progress = time.time()
+                        ml = _RE_LR.search(line)
+                        if ml:
+                            with state.lock:
+                                state.lr = float(ml.group(1))
+                        state.log(line)
+                if time.time() - last_progress > stall_seconds:
+                    stalled = True
+                    break
+
+            if stalled:
+                state.log(f'⚠️ {stall_minutes}분 동안 진행 없음(행/hang) 감지 → 프로세스를 강제 종료합니다.')
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=30)
+                except Exception:
+                    pass
+                rc = None
+            else:
+                # drain any buffered remaining output before checking the exit code
+                while not eof:
+                    raw = q.get()
+                    if raw is None:
+                        break
+                    line = raw.rstrip('\n')
+                    if line:
+                        state.log(line)
+                rc = proc.wait()
+
+            if state.stop_requested:
+                state.log('사용자 요청으로 학습 중단됨')
+                with state.lock:
+                    state.message = '중단됨 (Stopped)'
+                return
+
+            if not stalled and rc == 0:
+                state.log('학습 완료' + (f' (재시작 {attempt}회 후)' if attempt else ''))
                 with state.lock:
                     state.message = '완료 (Done)'
-            else:
-                state.log(f'학습 프로세스가 코드 {ret} 로 종료되었습니다.')
+                return
+
+            # unexpected stop (stall or non-zero exit) -> auto-restart from checkpoint
+            if not stalled:
+                state.log(f'⚠️ 학습 프로세스가 코드 {rc} 로 비정상 종료되었습니다.')
+            attempt += 1
+            with state.lock:
+                state.restarts = attempt
+            if attempt > max_restarts:
+                state.log(f'❌ 최대 재시작 횟수({max_restarts})를 초과했습니다. 자동 재시작을 중단합니다. '
+                          f'원인(디스크/네트워크/전원 설정 등)을 확인 후 수동으로 다시 시작하세요.')
                 with state.lock:
-                    state.message = f'오류 (exit {ret})'
+                    state.message = f'오류 (재시작 {max_restarts}회 초과)'
+                return
+            state.log(f'🔁 {backoff_seconds}초 후 마지막 체크포인트부터 자동 재시작합니다 '
+                      f'(누적 재시작 {attempt}회).')
+            with state.lock:
+                state.message = f'재시작 대기 중... ({attempt}/{max_restarts})'
+            waited = 0.0
+            while waited < backoff_seconds:
+                if state.stop_requested:
+                    state.log('사용자 요청으로 학습 중단됨 (재시작 취소)')
+                    with state.lock:
+                        state.message = '중단됨 (Stopped)'
+                    return
+                time.sleep(min(2, backoff_seconds - waited))
+                waited += 2
     except Exception:
         state.log('학습 중 예외 발생:\n' + traceback.format_exc())
         with state.lock:
@@ -530,7 +641,7 @@ def _format_status(snap):
     return ep, it, lr, snap['message'], loss_str, snap['logs']
 
 
-def start_training(cfg_path, *values):
+def start_training(cfg_path, stall_minutes, max_restarts, *values):
     cfg = _cfg_from_values(values)
     save_config(cfg, cfg_path or DEFAULT_CONFIG_PATH)
 
@@ -571,8 +682,14 @@ def start_training(cfg_path, *values):
     resume_msg = _resume_args(cfg)[1]
     if resume_msg:
         STATE.log(resume_msg)
+    STATE.log(f'⚙️ 행(hang) 감시: {float(stall_minutes or 20):.0f}분 동안 진행 없으면 자동 재시작 '
+              f'(최대 {int(max_restarts or 20)}회) — PC 절전/최대절전은 꺼두세요.')
 
-    thread = threading.Thread(target=training_worker, args=(cfg, STATE), daemon=True)
+    thread = threading.Thread(
+        target=training_worker,
+        args=(cfg, STATE), kwargs=dict(stall_minutes=float(stall_minutes or 20),
+                                       max_restarts=int(max_restarts or 20)),
+        daemon=True)
     thread.start()
 
     while True:
@@ -1784,6 +1901,15 @@ def build_ui():
         # ---- Tab 6 : Train & Monitor ----------------------------------- #
         with gr.Tab('6. 학습 실행 / 모니터링'):
             gr.Markdown('현재 설정으로 `train.py` 를 실행합니다. 시작 시 모든 탭의 값이 저장됩니다.')
+            gr.Markdown(
+                'ℹ️ **행(hang) 자동 복구** — 장시간(1~2일) 학습 중 프로세스가 죽지 않은 채 멈추는 경우'
+                '(DataLoader 정지, GPU/드라이버 행, 네트워크 드라이브 I/O 정지 등)를 대비해, 아래 시간 동안'
+                ' 진행(iters/epoch 로그)이 없으면 **자동으로 프로세스를 종료하고 마지막 체크포인트부터 재시작**'
+                '합니다. 웹페이지/브라우저 연결이 끊겨도 학습 자체(백그라운드 프로세스)는 계속 진행됩니다 — '
+                '단, **PC가 절전/최대절전 모드로 들어가면 안 됩니다** (자세한 OS 설정은 docs/RESILIENT_TRAINING.md).')
+            with gr.Row():
+                stall_minutes = gr.Number(20, label='행(hang) 감지 시간 (분)', precision=0)
+                max_restarts = gr.Number(20, label='최대 자동 재시작 횟수', precision=0)
             with gr.Row():
                 start_btn = gr.Button('▶ 학습 시작', variant='primary')
                 stop_btn = gr.Button('⏹ 중단', variant='stop')
@@ -1796,7 +1922,9 @@ def build_ui():
             st_log = gr.Textbox(label='로그 (Log)', lines=18, interactive=False, max_lines=18)
 
             monitor_outputs = [st_epoch, st_iters, st_lr, st_msg, st_loss, st_log]
-            start_btn.click(start_training, inputs=[cfg_path] + ordered_inputs, outputs=monitor_outputs)
+            start_btn.click(start_training,
+                            inputs=[cfg_path, stall_minutes, max_restarts] + ordered_inputs,
+                            outputs=monitor_outputs)
             stop_btn.click(stop_training, outputs=st_msg)
 
         # ---- Tab 7 : Inference ----------------------------------------- #
