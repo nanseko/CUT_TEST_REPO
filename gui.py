@@ -66,14 +66,20 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 # up to date (printed on launch and shown in the UI header). If the version you
 # see in the browser/console does not match the latest, you are running an old
 # copy and must replace gui.py / preprocessing/.
-BUILD = '2026-07-08.1 (loss-curves+hybrid-self-eca-attention)'
+BUILD = '2026-07-08.2 (config-persistence+per-checkpoint-hparams)'
 
 
 # --------------------------------------------------------------------------- #
 # Configuration handling
 # --------------------------------------------------------------------------- #
 
-DEFAULT_CONFIG_PATH = './gui_config.json'
+# ABSOLUTE path, anchored to gui.py's own location (NOT the process's current
+# working directory). A relative path here caused settings (esp. dataroot /
+# checkpoints_dir / results_dir) to silently "reset" on server restart: if
+# gui.py is launched from a different working directory each time (a desktop
+# shortcut, a batch file, Task Scheduler, ...), './gui_config.json' resolves
+# to a different file every time, so the previous save is never found.
+DEFAULT_CONFIG_PATH = os.path.join(REPO_ROOT, 'gui_config.json')
 
 # kept as a literal (not imported from evaluation.EVAL_CSV_COLUMNS) so the GUI
 # module can build its layout even if evaluation/ is temporarily mismatched;
@@ -198,6 +204,93 @@ def do_save(cfg_path, *values):
     cfg = _cfg_from_values(values)
     path = save_config(cfg, cfg_path or DEFAULT_CONFIG_PATH)
     return f'✅ 저장됨: {path}  ({datetime.datetime.now().strftime("%H:%M:%S")})'
+
+
+# --------------------------------------------------------------------------- #
+# Per-checkpoint hyperparameter snapshot (so switching between experiments and
+# resuming each with ITS OWN settings doesn't require remembering/retyping
+# them). This is separate from gui_config.json (the GUI's own "last used"
+# settings) and from CUT's own <name>/train_opt.txt (a human-readable dump,
+# not shaped to round-trip back into these widgets).
+# --------------------------------------------------------------------------- #
+
+CHECKPOINT_CONFIG_FILENAME = 'gui_train_config.json'
+
+# keys that determine the network's actual weight SHAPES: if these differ from
+# what a checkpoint was originally trained with, loading its state_dict for
+# --continue_train will fail (or silently mismatch). See docs/HANDOFF.md §10.
+ARCH_CRITICAL_KEYS = [
+    'netG', 'normG', 'attention_type', 'attention_reduction',
+    'attention_encoder', 'attention_resblocks', 'attention_decoder',
+    'no_antialias', 'no_antialias_up',
+    'hrnet_branches', 'hrnet_modules', 'hrnet_blocks',
+]
+
+
+def _checkpoint_config_path(checkpoints_dir, name):
+    return os.path.join(str(checkpoints_dir), str(name), CHECKPOINT_CONFIG_FILENAME)
+
+
+def save_checkpoint_config(cfg):
+    """Snapshot the full hyperparameter set into checkpoints_dir/<name>/ at the
+    moment training starts, so this exact experiment's settings can be
+    restored later even after other checkpoints have been trained in between."""
+    path = _checkpoint_config_path(cfg['checkpoints_dir'], cfg['name'])
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        payload = dict(cfg)
+        payload['_saved_at'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        payload['_build'] = BUILD
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        return path
+    except Exception:
+        return None
+
+
+def load_checkpoint_config(checkpoints_dir, name):
+    """Read back a previously-saved per-checkpoint config. None if absent/unreadable."""
+    path = _checkpoint_config_path(checkpoints_dir, name)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def list_checkpoint_experiments(checkpoints_dir):
+    """Names of experiment subfolders under checkpoints_dir: prefers ones with
+    a gui_train_config.json, but also surfaces older checkpoints (trained
+    before this feature existed, or via bare CLI) that only have *_net_G.pth,
+    so the dropdown is never mysteriously empty for an existing project."""
+    d = str(checkpoints_dir)
+    if not os.path.isdir(d):
+        return []
+    names = []
+    for entry in sorted(os.listdir(d)):
+        sub = os.path.join(d, entry)
+        if not os.path.isdir(sub):
+            continue
+        has_config = os.path.exists(os.path.join(sub, CHECKPOINT_CONFIG_FILENAME))
+        has_ckpt = any(f.endswith('_net_G.pth') for f in os.listdir(sub))
+        if has_config or has_ckpt:
+            names.append(entry + ('' if has_config else '  (설정 로그 없음)'))
+    return names
+
+
+def arch_mismatch_warnings(old_cfg, new_cfg):
+    """Compare architecture-critical keys; return a list of human-readable
+    mismatch descriptions (empty if everything matches or old_cfg is None)."""
+    if not old_cfg:
+        return []
+    out = []
+    for k in ARCH_CRITICAL_KEYS:
+        ov, nv = old_cfg.get(k), new_cfg.get(k)
+        if str(ov) != str(nv):
+            out.append(f'{k}: 체크포인트={ov!r} vs 현재 설정={nv!r}')
+    return out
 
 
 def do_scan(dataroot):
@@ -691,6 +784,30 @@ def start_training(cfg_path, stall_minutes, max_restarts, *values):
     STATE.log(f'⚙️ 행(hang) 감시: {float(stall_minutes or 20):.0f}분 동안 진행 없으면 자동 재시작 '
               f'(최대 {int(max_restarts or 20)}회) — PC 절전/최대절전은 꺼두세요.')
 
+    # architecture-mismatch guard: if resuming a checkpoint, warn loudly when
+    # the CURRENT tab 4/5 settings differ from what this checkpoint was
+    # actually trained with (netG/attention/hrnet mismatches make the saved
+    # weights fail -- or silently mismatch -- to load). Not blocking, since a
+    # deliberate architecture change is a valid (if unusual) thing to do.
+    if _bool(cfg.get('continue_train')):
+        prev_cfg = load_checkpoint_config(cfg['checkpoints_dir'], cfg['name'])
+        mismatches = arch_mismatch_warnings(prev_cfg, cfg)
+        if mismatches:
+            STATE.log('⚠️⚠️ 아키텍처 설정이 이 체크포인트를 학습할 때와 다릅니다! '
+                      '가중치 로드가 실패하거나 잘못될 수 있습니다:')
+            for m in mismatches:
+                STATE.log('   - ' + m)
+            STATE.log('   → 탭 6의 "📂 체크포인트 설정 불러오기"로 원래 설정을 복원할 수 있습니다.')
+        elif prev_cfg is not None:
+            STATE.log('✅ 아키텍처 설정이 이전 체크포인트와 일치합니다.')
+
+    # snapshot this run's full hyperparameter set next to the checkpoint, so it
+    # can be restored later (탭 6의 "체크포인트 설정 불러오기") even after other
+    # experiments have been trained in between.
+    ckpt_cfg_path = save_checkpoint_config(cfg)
+    if ckpt_cfg_path:
+        STATE.log(f'설정 스냅샷 저장: {ckpt_cfg_path}')
+
     thread = threading.Thread(
         target=training_worker,
         args=(cfg, STATE), kwargs=dict(stall_minutes=float(stall_minutes or 20),
@@ -719,6 +836,39 @@ def stop_training():
                 pass
         return '⏹️ 중단 요청됨. 프로세스를 종료합니다.'
     return 'ℹ️ 실행 중인 학습이 없습니다.'
+
+
+def refresh_checkpoint_dropdown(checkpoints_dir):
+    names = list_checkpoint_experiments(checkpoints_dir)
+    return gr.update(choices=names, value=(names[0] if names else None))
+
+
+def cfg_apply_checkpoint(checkpoints_dir, name):
+    """Load <checkpoints_dir>/<name>/gui_train_config.json (written when that
+    experiment's training was started) and restore it into every Tab 1-5
+    widget, so switching between experiments and resuming each one uses ITS
+    OWN original settings instead of whatever is currently on screen."""
+    if not name:
+        return ['실험을 먼저 선택하세요.'] + [gr.update() for _ in CONFIG_KEYS]
+    real_name = name.split('  (설정 로그 없음)')[0]
+    saved = load_checkpoint_config(checkpoints_dir, real_name)
+    if not saved:
+        return ([f'"{real_name}" 에는 설정 로그가 없습니다 (이 기능이 추가되기 전에 학습된 '
+                f'체크포인트일 수 있습니다). checkpoints_dir/{real_name}/{CHECKPOINT_CONFIG_FILENAME} '
+                f'없음 — 수동으로 설정하세요.']
+               + [gr.update() for _ in CONFIG_KEYS])
+    msg = (f'✅ "{real_name}" 체크포인트의 설정을 불러왔습니다 '
+          f'(저장 시각: {saved.get("_saved_at", "?")}, build {saved.get("_build", "?")}). '
+          f'이제 탭 6에서 "이어서 학습"을 체크하고 학습을 시작하면 이 설정으로 이어집니다.')
+    # 'continue_train' is an action flag (was it a resume WHEN this snapshot was
+    # taken), not a durable hyperparameter -- restoring it verbatim would often
+    # silently uncheck "이어서 학습" (the snapshot from a first-ever run has it
+    # False), contradicting the very reason the user is loading this config.
+    # Leave whatever the user currently has checked untouched.
+    skip = {'continue_train'}
+    updates = [gr.update(value=saved[k]) if (k in saved and k not in skip) else gr.update()
+              for k in CONFIG_KEYS]
+    return [msg] + updates
 
 
 # --------------------------------------------------------------------------- #
@@ -1482,12 +1632,14 @@ def build_ui():
     with gr.Blocks(title='CUT + Attention 학습 GUI (PyTorch)', theme=gr.themes.Soft()) as demo:
         gr.Markdown('# CUT + Attention 학습 GUI (PyTorch)\n'
                     'SAR→Optical CUT 모델을 폴더 지정만으로 전처리·학습·추론합니다. '
-                    '각 탭에서 값을 수정하고 **저장** 버튼을 누르면 `gui_config.json`에 보존됩니다. '
+                    '**모든 탭의 값은 입력할 때마다 자동 저장**되어 서버를 재시작해도 그대로 남습니다 '
+                    '(`gui_config.json`). "저장" 버튼은 저장 시각을 명시적으로 확인하고 싶을 때만 누르면 됩니다.\n'
                     '학습/추론은 이 저장소의 `train.py` / `test.py` 를 실행합니다.')
 
         gr.Markdown(f'<sub>build: <code>{BUILD}</code> · gradio {getattr(gr, "__version__", "?")}</sub>')
 
         cfg_path = gr.Textbox(value=DEFAULT_CONFIG_PATH, label='설정 파일 경로 (config json)')
+        autosave_status = gr.Textbox(label='자동 저장 상태', interactive=False, value='(값을 변경하면 자동 저장됩니다)')
 
         env_txt = ('🟢 Colab 환경 감지됨 — 데이터셋 다운로드 사용 가능'
                    if IN_COLAB else
@@ -1899,6 +2051,13 @@ def build_ui():
         save_cut.click(do_save, inputs=[cfg_path] + ordered_inputs, outputs=save_cut_out)
         save_att.click(do_save, inputs=[cfg_path] + ordered_inputs, outputs=save_att_out)
 
+        # Auto-save: any field on any tab writes the FULL current config to
+        # disk immediately (not just the fields on that tab), so values never
+        # need a manual "저장" click to survive a server restart. Each widget's
+        # .change fires the same do_save with the full current value set.
+        for _widget in ordered_inputs:
+            _widget.change(do_save, inputs=[cfg_path] + ordered_inputs, outputs=autosave_status)
+
         # fill nce_layers with the recommended taps for the current architecture
         nce_reco_btn.click(
             gui_recommend_nce,
@@ -1914,6 +2073,22 @@ def build_ui():
         # ---- Tab 6 : Train & Monitor ----------------------------------- #
         with gr.Tab('6. 학습 실행 / 모니터링'):
             gr.Markdown('현재 설정으로 `train.py` 를 실행합니다. 시작 시 모든 탭의 값이 저장됩니다.')
+            gr.Markdown(
+                '📂 **체크포인트 설정 불러오기** — 여러 실험(체크포인트)을 오가며 학습할 때, 학습 시작 시점에 '
+                '`checkpoints_dir/<이름>/gui_train_config.json` 로 그 실험의 전체 설정이 자동 저장됩니다. '
+                '다른 체크포인트로 전환했다가 이 실험을 다시 이어서 학습하려면 아래에서 불러오세요 — '
+                '**특히 netG/attention/hrnet 설정이 어긋나면 가중치 로드가 실패**하므로, "이어서 학습" 전에 '
+                '항상 먼저 불러오는 걸 권장합니다.')
+            with gr.Row():
+                ckpt_picker = gr.Dropdown(choices=list_checkpoint_experiments(cfg['checkpoints_dir']),
+                                          label='체크포인트(실험) 선택', interactive=True)
+                ckpt_refresh_btn = gr.Button('🔄 목록 새로고침')
+                ckpt_load_btn = gr.Button('📂 이 설정 불러오기', variant='secondary')
+            ckpt_load_msg = gr.Textbox(label='불러오기 결과', interactive=False)
+            ckpt_refresh_btn.click(refresh_checkpoint_dropdown, inputs=[comp['checkpoints_dir']],
+                                   outputs=[ckpt_picker])
+            ckpt_load_btn.click(cfg_apply_checkpoint, inputs=[comp['checkpoints_dir'], ckpt_picker],
+                                outputs=[ckpt_load_msg] + ordered_inputs)
             gr.Markdown(
                 'ℹ️ **행(hang) 자동 복구** — 장시간(1~2일) 학습 중 프로세스가 죽지 않은 채 멈추는 경우'
                 '(DataLoader 정지, GPU/드라이버 행, 네트워크 드라이브 I/O 정지 등)를 대비해, 아래 시간 동안'
