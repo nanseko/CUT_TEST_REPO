@@ -49,7 +49,7 @@ from evaluation.evaluate import compute_structure_metrics
 
 DEFAULT_SPACE = {
     # attention: what / where / how strong
-    'attention_type': ['none', 'coord', 'cbam'],
+    'attention_type': ['none', 'coord', 'cbam', 'eca', 'self', 'cbam_coord'],
     'attention_positions': ['enc', 'enc+res', 'enc+res+dec'],
     'attention_reduction': [8, 16],
     # structure / hallucination losses

@@ -6,8 +6,13 @@
 - **작성일**: 2026-07-08
 - **대상 저장소**: `nanseko/cut_test_repo`
 - **작업 브랜치**: `claude/nice-ptolemy-5UQLR` (⚠️ **이 브랜치에서만 개발·푸시**. 다른 브랜치 푸시 금지)
-- **현재 BUILD 마커**: `gui.py` 안 `BUILD = '2026-07-06.1 (training-watchdog+resilience)'`
-- **가장 최근 커밋**: `3bc69b2 Add stall (hang) watchdog with auto-restart for long unattended training runs`
+- **현재 BUILD 마커**: `gui.py` 안 `BUILD = '2026-07-08.1 (loss-curves+hybrid-self-eca-attention)'`
+- **가장 최근 커밋 계열**: 손실 그래프(`util/loss_plot.py`) + 추가 attention(self/eca/cbam_coord)
+
+> ⚠️ **환경 주의**: 세션 컨테이너는 ephemeral이라 재개 시 torch/torchvision/matplotlib/dominate 등이
+> 사라질 수 있다. 검증 전 `pip install torch torchvision matplotlib dominate` 필요할 수 있음
+> (기본 pip 인덱스는 프록시 통과, `download.pytorch.org`는 403). visdom/GPUtil은 빌드 실패해도
+> `display_id=0` CPU 학습에는 불필요.
 
 ---
 

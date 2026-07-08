@@ -20,7 +20,10 @@ if ROOT not in sys.path:
 
 import numpy as np
 
-from models.attention import CBAM, CoordinateAttention, make_attention
+from models.attention import (
+    CBAM, CoordinateAttention, ECA, SelfAttention, SequentialAttention,
+    make_attention, ATTENTION_TYPES,
+)
 from models.networks import ResnetGenerator, HRNetGenerator, PatchSampleF
 from models.losses_extra import (
     gradient_loss, laplacian_loss, color_moment_loss, coherence_loss,
@@ -30,10 +33,26 @@ from models.losses_extra import (
 
 def test_attention_shapes():
     x = torch.randn(2, 64, 32, 32)
-    assert CBAM(64)(x).shape == x.shape
-    assert CoordinateAttention(64)(x).shape == x.shape
-    assert make_attention('none', 64)(x).shape == x.shape
-    print('attention shape: OK')
+    # every registered attention type preserves the tensor shape
+    for t in ATTENTION_TYPES:
+        assert make_attention(t, 64, 16)(x).shape == x.shape, t
+    # self-attention is identity at init (gamma=0) -> no behaviour change until trained
+    sa = make_attention('self', 64, 8)
+    assert torch.allclose(sa(x), x, atol=1e-6), 'self-attn must be identity at init'
+    # ECA is near-parameter-free vs CBAM's reduction MLP
+    n_eca = sum(p.numel() for p in make_attention('eca', 64).parameters())
+    n_cbam = sum(p.numel() for p in make_attention('cbam', 64, 16).parameters())
+    assert n_eca < n_cbam, (n_eca, n_cbam)
+    # hybrid applies CBAM first, then Coordinate Attention (order matters)
+    hy = make_attention('cbam_coord', 64, 16)
+    assert isinstance(hy, SequentialAttention)
+    assert isinstance(hy.first, CBAM) and isinstance(hy.second, CoordinateAttention)
+    # gradients flow through the new modules
+    for t in ('eca', 'self', 'cbam_coord'):
+        xx = torch.randn(1, 32, 8, 8, requires_grad=True)
+        make_attention(t, 32, 8)(xx).sum().backward()
+        assert xx.grad is not None and torch.isfinite(xx.grad).all(), t
+    print(f'attention shape/types ({len(ATTENTION_TYPES)}): OK  (ECA params={n_eca} << CBAM {n_cbam})')
 
 
 def test_generator(attention_type, **flags):
@@ -192,8 +211,12 @@ def main():
     test_generator('coord', attention_encoder=True, attention_resblocks=True)
     test_generator('cbam', attention_encoder=True, attention_resblocks=True, attention_decoder=True)
     test_generator('coord', attention_encoder=True, attention_resblocks=True, no_antialias=True)
+    test_generator('eca', attention_encoder=True, attention_resblocks=True)
+    test_generator('self', attention_resblocks=True)          # non-local: resblocks (low-res) only
+    test_generator('cbam_coord', attention_encoder=True, attention_resblocks=True)
     test_hrnet('none')
     test_hrnet('coord', attention_encoder=True, attention_resblocks=True)
+    test_hrnet('eca', attention_resblocks=True)
     test_losses()
     test_reflector_saliency()
     test_coherence_loss()

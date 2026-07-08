@@ -66,7 +66,7 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 # up to date (printed on launch and shown in the UI header). If the version you
 # see in the browser/console does not match the latest, you are running an old
 # copy and must replace gui.py / preprocessing/.
-BUILD = '2026-07-06.1 (training-watchdog+resilience)'
+BUILD = '2026-07-08.1 (loss-curves+hybrid-self-eca-attention)'
 
 
 # --------------------------------------------------------------------------- #
@@ -246,6 +246,7 @@ class TrainingState:
         self.log_file = None
         self.proc = None
         self.restarts = 0
+        self.loss_png = None
 
     def log(self, text):
         stamp = datetime.datetime.now().strftime('%H:%M:%S')
@@ -272,6 +273,7 @@ class TrainingState:
                 'losses': dict(self.losses),
                 'message': self.message,
                 'logs': '\n'.join(self.logs[-300:]),
+                'loss_png': self.loss_png,
             }
 
 
@@ -638,7 +640,9 @@ def _format_status(snap):
     it = str(snap['iters'])
     lr = f"{snap['lr']:.7f}" if snap['lr'] else '-'
     loss_str = ', '.join(f'{k}={v:.4f}' for k, v in snap['losses'].items()) or '-'
-    return ep, it, lr, snap['message'], loss_str, snap['logs']
+    png = snap.get('loss_png')
+    png = png if (png and os.path.exists(png)) else None   # only show once the first epoch has rendered it
+    return ep, it, lr, snap['message'], loss_str, snap['logs'], png
 
 
 def start_training(cfg_path, stall_minutes, max_restarts, *values):
@@ -660,6 +664,8 @@ def start_training(cfg_path, stall_minutes, max_restarts, *values):
     STATE.reset()
     STATE.log_file = os.path.join(
         log_dir, f'gui_train_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}.log')
+    # train.py refreshes this PNG at the end of every epoch (util/loss_plot.py)
+    STATE.loss_png = os.path.join(str(cfg['checkpoints_dir']), str(cfg['name']), 'loss_curve.png')
     STATE.running = True
     STATE.message = '학습 준비 중...'
 
@@ -1855,9 +1861,16 @@ def build_ui():
 
         # ---- Tab 5 : Attention ----------------------------------------- #
         with gr.Tab('5. Attention 설정'):
-            comp['attention_type'] = gr.Radio(['none', 'cbam', 'coord'],
+            comp['attention_type'] = gr.Radio(['none', 'cbam', 'coord', 'eca', 'self', 'cbam_coord'],
                                               value=cfg['attention_type'],
                                               label='Attention 종류 (none = 완전 OFF)')
+            gr.Markdown(
+                '- **cbam**: 채널+공간 attention (범용) · **coord**: 방향성(H/W) 위치 인코딩\n'
+                '- **eca**: 경량 채널 attention (파라미터 거의 없음, 안정적)\n'
+                '- **self**: non-local self-attention — 이미지 전역 픽셀 관계를 모델링해 '
+                '**건물/선박의 전체 형태 일관성** 보존에 유리. 단 메모리 비용이 커서 '
+                '**resblocks 위치(저해상도)에만** 삽입 권장(encoder/decoder 체크 시 고해상도라 무거움).\n'
+                '- **cbam_coord**: 하이브리드 — CBAM 적용 후 Coordinate Attention을 이어서 적용(직렬)')
             comp['attention_reduction'] = gr.Number(cfg['attention_reduction'],
                                                     label='attention_reduction (bottleneck 축소비)', precision=0)
             gr.Markdown('**적용 위치 On/Off** — 개별 토글하거나 아래 버튼으로 모두 켜고 끌 수 있습니다. '
@@ -1920,8 +1933,14 @@ def build_ui():
                 st_msg = gr.Textbox(label='상태', interactive=False)
             st_loss = gr.Textbox(label='현재 손실', interactive=False)
             st_log = gr.Textbox(label='로그 (Log)', lines=18, interactive=False, max_lines=18)
+            gr.Markdown(
+                '📈 **epoch별 손실 그래프** — 매 epoch 끝마다 자동 갱신되어 '
+                '`checkpoints_dir/<name>/loss_curve.png` (+ `loss_history.csv`)로 저장됩니다. '
+                '위: D / G / NCE 주요 곡선, 아래: 세부 손실. D가 0으로 붕괴하거나 G_GAN이 발산하면 '
+                '학습 불균형 신호입니다. 400 epoch 완료 시 최종 그래프가 체크포인트에 남습니다.')
+            st_graph = gr.Image(label='손실 곡선 (loss_curve.png)', interactive=False, type='filepath')
 
-            monitor_outputs = [st_epoch, st_iters, st_lr, st_msg, st_loss, st_log]
+            monitor_outputs = [st_epoch, st_iters, st_lr, st_msg, st_loss, st_log, st_graph]
             start_btn.click(start_training,
                             inputs=[cfg_path, stall_minutes, max_restarts] + ordered_inputs,
                             outputs=monitor_outputs)

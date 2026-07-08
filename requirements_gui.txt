@@ -4,6 +4,7 @@ gradio>=4.0
 numpy
 pillow
 requests          # M4-SAR dataset download (Colab)
-# optional preprocessing extras:
+# optional extras:
 # bm3d            # BM3D speckle filter (else falls back to refined_lee)
 # opencv-python   # CLAHE in histogram mapping + Tab 9 형상 후처리 (직사각 스냅)
+# matplotlib      # Tab 6 epoch별 손실 그래프 loss_curve.png (없으면 loss_history.csv만 저장)

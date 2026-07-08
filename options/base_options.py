@@ -46,8 +46,11 @@ class BaseOptions():
         parser.add_argument('--no_antialias', action='store_true', help='if specified, use stride=2 convs instead of antialiased-downsampling (sad)')
         parser.add_argument('--no_antialias_up', action='store_true', help='if specified, use [upconv(learned filter)] instead of [upconv(hard-coded [1,3,3,1] filter), conv]')
         # attention parameters (CBAM / Coordinate attention in the Resnet generator)
-        parser.add_argument('--attention_type', type=str, default='none', choices=['none', 'cbam', 'coord'],
-                            help='attention module inserted in the generator: none | cbam | coord')
+        parser.add_argument('--attention_type', type=str, default='none',
+                            choices=['none', 'cbam', 'coord', 'eca', 'self', 'cbam_coord'],
+                            help='attention module inserted in the generator: none | cbam | coord | '
+                                 'eca (efficient channel) | self (non-local, global shape) | '
+                                 'cbam_coord (hybrid: CBAM then Coordinate)')
         parser.add_argument('--attention_reduction', type=int, default=16,
                             help='channel bottleneck reduction ratio for attention modules')
         parser.add_argument('--attention_encoder', action='store_true',

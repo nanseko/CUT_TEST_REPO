@@ -972,7 +972,7 @@ class ResnetGenerator(nn.Module):
         exposes the corrected PatchNCE tap indices via ``self.nce_default``.
         """
         assert(n_blocks >= 0)
-        assert attention_type in ('none', 'cbam', 'coord')
+        assert attention_type in ('none', 'cbam', 'coord', 'eca', 'self', 'cbam_coord', 'hybrid')
         super(ResnetGenerator, self).__init__()
         self.opt = opt
         if type(norm_layer) == functools.partial:

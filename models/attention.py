@@ -84,12 +84,90 @@ class CoordinateAttention(nn.Module):
         return x * attn_h * attn_w
 
 
+class ECA(nn.Module):
+    """Efficient Channel Attention (ECA-Net). A lightweight channel-only
+    attention: instead of CBAM's dimensionality-reducing MLP, it captures
+    local cross-channel interaction with a single 1-D convolution over the
+    channel-descriptor, so it adds almost no parameters. Good, stable channel
+    re-weighting but (unlike coord/spatial) carries no spatial/shape cue."""
+    def __init__(self, channels, k_size=3):
+        super().__init__()
+        if k_size % 2 == 0:
+            k_size += 1
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=k_size // 2, bias=False)
+
+    def forward(self, x):
+        b, c, _, _ = x.shape
+        y = x.mean(dim=(2, 3))                    # [B, C] global avg descriptor
+        y = self.conv(y.unsqueeze(1))             # [B, 1, C] 1-D conv over channels
+        w = torch.sigmoid(y).view(b, c, 1, 1)
+        return x * w
+
+
+class SelfAttention(nn.Module):
+    """Non-local / self-attention (SAGAN-style) for NCHW tensors.
+
+    Models pairwise relationships between ALL spatial positions, so a pixel on
+    one edge of a building/ship can be informed by the opposite edge — directly
+    useful for preserving the GLOBAL shape consistency of rigid objects that
+    purely local (CBAM/coord) attention cannot enforce. Cost is O((H*W)^2) in
+    memory, so insert it only at low-resolution taps (e.g. resblocks), NOT at
+    full resolution. Uses a learned residual scale ``gamma`` initialised to 0,
+    so at init the module is an identity (no behaviour change until trained)."""
+    def __init__(self, channels, reduction=8):
+        super().__init__()
+        inter = max(channels // reduction, 1)
+        self.query = nn.Conv2d(channels, inter, 1)
+        self.key = nn.Conv2d(channels, inter, 1)
+        self.value = nn.Conv2d(channels, channels, 1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        n = h * w
+        q = self.query(x).view(b, -1, n).permute(0, 2, 1)   # [B, N, C']
+        k = self.key(x).view(b, -1, n)                       # [B, C', N]
+        attn = self.softmax(torch.bmm(q, k))                 # [B, N, N]
+        v = self.value(x).view(b, c, n)                      # [B, C, N]
+        out = torch.bmm(v, attn.permute(0, 2, 1)).view(b, c, h, w)
+        return x + self.gamma * out
+
+
+class SequentialAttention(nn.Module):
+    """Apply two attention modules back-to-back (hybrid). Default cbam->coord:
+    CBAM first re-weights channels and salient regions, then Coordinate
+    Attention adds directional (H/W) position encoding on top — the two
+    strengths stacked in sequence."""
+    def __init__(self, first, second):
+        super().__init__()
+        self.first = first
+        self.second = second
+
+    def forward(self, x):
+        return self.second(self.first(x))
+
+
 def make_attention(attention_type, channels, reduction=16):
-    """Factory returning an attention module or Identity for 'none'."""
+    """Factory returning an attention module or Identity for 'none'.
+
+    Supported: 'none' | 'cbam' | 'coord' | 'eca' | 'self' |
+               'cbam_coord' (hybrid: CBAM then Coordinate Attention).
+    """
     if attention_type == 'none' or attention_type is None:
         return nn.Identity()
     if attention_type == 'cbam':
         return CBAM(channels, reduction)
     if attention_type == 'coord':
         return CoordinateAttention(channels, reduction)
+    if attention_type == 'eca':
+        return ECA(channels)
+    if attention_type == 'self':
+        return SelfAttention(channels, reduction)
+    if attention_type in ('cbam_coord', 'hybrid'):
+        return SequentialAttention(CBAM(channels, reduction),
+                                   CoordinateAttention(channels, reduction))
     raise ValueError(f'Unsupported attention type: {attention_type}')
+
+
+ATTENTION_TYPES = ['none', 'cbam', 'coord', 'eca', 'self', 'cbam_coord']

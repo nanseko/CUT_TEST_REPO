@@ -74,4 +74,15 @@ if __name__ == '__main__':
             model.save_networks(epoch)
 
         print('End of epoch %d / %d \t Time Taken: %d sec' % (epoch, opt.n_epochs + opt.n_epochs_decay, time.time() - epoch_start_time))
+
+        # refresh the per-epoch D/G/NCE loss curve (PNG + CSV) in the checkpoint
+        # folder every epoch, so progress is inspectable mid-run and the final
+        # graph is present when the last epoch finishes. Best-effort; never
+        # interrupts training.
+        try:
+            from util.loss_plot import update_loss_plot
+            update_loss_plot(opt.checkpoints_dir, opt.name)
+        except Exception:
+            pass
+
         model.update_learning_rate()                     # update learning rates at the end of every epoch.
