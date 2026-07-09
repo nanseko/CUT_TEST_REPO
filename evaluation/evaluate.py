@@ -189,19 +189,21 @@ def _append_row(results_dir, name, row):
 def run_evaluation(results_dir, name, epoch='latest', experiment='', notes='',
                    eo_dir=None, checkpoints_dir=None, cfg=None,
                    compute_identity=False, real_b_dir=None, device=None,
-                   inception_weights=None, fid_max=500, quality_max=0, struct_max=0):
-    """One-button CUT output evaluation. Reads
+                   inception_weights=None, fid_max=500, quality_max=0, struct_max=0,
+                   fake_dir=None, real_a_dir=None):
+    """One-button CUT output evaluation. By default reads
     <results_dir>/<name>/test_<epoch>/images/{fake_B,real_A[,real_B]} (as
-    produced by test.py / the Web-UI inference tab), computes FID/KID vs
-    eo_dir, structure metrics vs real_A, optionally generates+evaluates the
-    identity path (real_B -> idt_B via the checkpoint), and no-reference
-    quality of fake_B. Appends one row to
-    <results_dir>/<name>/eval_logs/eval_results.csv (resumable comparison log)
-    and yields progress strings.
+    produced by test.py / the Web-UI inference tab); pass `fake_dir`/
+    `real_a_dir` to analyse any other folder pair instead (e.g. a different
+    results_dir, or trainA/trainB). Computes FID/KID vs eo_dir, structure
+    metrics vs real_A, optionally generates+evaluates the identity path
+    (real_B -> idt_B via the checkpoint), and no-reference quality of fake_B.
+    Appends one row to <results_dir>/<name>/eval_logs/eval_results.csv
+    (resumable comparison log) and yields progress strings.
     """
     test_dir = os.path.join(str(results_dir), str(name), f'test_{epoch}', 'images')
-    fake_dir = os.path.join(test_dir, 'fake_B')
-    real_a_dir = os.path.join(test_dir, 'real_A')
+    fake_dir = fake_dir or os.path.join(test_dir, 'fake_B')
+    real_a_dir = real_a_dir or os.path.join(test_dir, 'real_A')
     real_b_dir_out = os.path.join(test_dir, 'real_B')
     logs = []
 
@@ -211,7 +213,8 @@ def run_evaluation(results_dir, name, epoch='latest', experiment='', notes='',
 
     if not os.path.isdir(fake_dir):
         yield log(f'오류: fake_B 폴더가 없습니다: {fake_dir}\n'
-                  f'먼저 "7. 추론/테스트" 로 test.py 를 실행해 결과를 생성하세요.')
+                  f'먼저 "7. 추론/테스트" 로 test.py 를 실행해 결과를 생성하거나, '
+                  f'"fake_B 폴더 직접 지정"에 분석할 폴더를 입력하세요.')
         return
     yield log(f'평가 대상: {fake_dir}')
 

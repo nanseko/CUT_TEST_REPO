@@ -49,6 +49,26 @@ def test_config_path_is_absolute_and_cwd_independent():
     print('config path absolute + CWD-independent: OK')
 
 
+def test_pp_config_path_is_absolute_too():
+    # the preprocessing tab (Tab 2) has its OWN config file with the exact
+    # same relative-path bug that used to affect gui_config.json
+    assert os.path.isabs(gui.PP_CONFIG_PATH), gui.PP_CONFIG_PATH
+    assert gui.PP_CONFIG_PATH == os.path.join(gui.REPO_ROOT, 'preproc_config.json')
+    print('PP_CONFIG_PATH (Tab 2) absolute: OK')
+
+
+def test_per_tab_folder_fields_are_config_keys():
+    # Tab 8 (평가)/Tab 9 (후처리) data-folder fields must be real CONFIG_KEYS
+    # widgets so the same auto-save mechanism persists them across restarts
+    # (previously these were plain local Textboxes, outside CONFIG_KEYS, and
+    # were lost on every restart regardless of the path-persistence fix).
+    for k in ('eval_eo_dir', 'eval_real_b_dir', 'eval_fake_dir', 'eval_real_a_dir',
+             'rectify_input_dir'):
+        assert k in gui.CONFIG_KEYS, f'{k} missing from CONFIG_KEYS'
+        assert k in gui.DEFAULTS, f'{k} missing from DEFAULTS'
+    print('per-tab folder fields are persisted CONFIG_KEYS: OK')
+
+
 def test_build_ui_and_config_keys_consistency():
     demo = gui.build_ui()
     assert demo is not None
@@ -207,6 +227,8 @@ def test_start_training_snapshot_and_mismatch_guard():
 
 def main():
     test_config_path_is_absolute_and_cwd_independent()
+    test_pp_config_path_is_absolute_too()
+    test_per_tab_folder_fields_are_config_keys()
     test_build_ui_and_config_keys_consistency()
     test_autosave_roundtrip()
     test_checkpoint_config_snapshot_roundtrip()

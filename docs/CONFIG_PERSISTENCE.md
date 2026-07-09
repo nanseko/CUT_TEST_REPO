@@ -73,6 +73,25 @@ checkpoints_dir/<name>/gui_train_config.json
 
 ---
 
+## 3. 탭마다 데이터 폴더 지정 (전처리/학습/후처리/평가)
+
+기존엔 `dataroot`를 **탭 1(데이터셋)에서만** 지정할 수 있었고, 후처리(탭 9)·평가(탭 8)는 항상
+`results_dir/name/test_<epoch>/images/...` 라는 **고정된 규칙으로 자동 유도된 폴더**만 볼 수 있었습니다.
+이제 각 탭에서 직접 폴더를 지정할 수 있고, **전부 자동저장 대상(CONFIG_KEYS)** 이라 서버를 껐다 켜도 남습니다.
+
+| 탭 | 필드 | 기본 동작 |
+|---|---|---|
+| 2. 전처리 | 입력/출력 폴더 (`pp_in`/`pp_out`, 이미 있었음) | 상대경로 버그 수정 + 자동저장 추가 (`PP_CONFIG_PATH`도 절대경로로) |
+| 3. 학습 | `dataroot` 미러 필드 | 탭 1과 같은 값을 이 탭에서도 바로 편집 가능(탭1의 `dataroot`에 반영·저장됨) |
+| 8. 평가 | `eval_fake_dir`/`eval_real_a_dir`(신규), `eval_eo_dir`/`eval_real_b_dir`(기존을 CONFIG_KEYS로 승격) | 비워두면 기존처럼 `results_dir/name/test_<epoch>/...` 자동 사용, 채우면 **그 폴더로 평가** |
+| 9. 후처리 | `rectify_input_dir`(신규) | 비워두면 자동(`fake_B`), 채우면 **그 폴더 전체**를 분석 |
+
+**주의**: 탭 3의 `dataroot` 미러는 **탭3→탭1 방향으로만** 자동 반영됩니다(탭 1에서 바꾼 값이 탭 3
+표시에 즉시 반영되려면 페이지 새로고침이 필요). 실제 저장되는 값은 항상 같은 `dataroot` 하나이므로
+데이터 불일치 위험은 없습니다.
+
+---
+
 ## 검증
 `python tests/test_config_persistence.py`:
 - 설정 경로가 절대경로이고 실행 위치(CWD)와 무관하게 항상 동일함(다른 프로세스/디렉토리로 실측)
@@ -83,3 +102,7 @@ checkpoints_dir/<name>/gui_train_config.json
 - 설정 불러오기 시 `continue_train`은 보존되고 나머지는 복원됨, 없는 실험 선택 시 안전 처리
 - **실제 학습으로 엔드투엔드**: 신규 시작(스냅샷 생성) → 다른 아키텍처로 이어서 시도(경고 발생) →
   같은 아키텍처로 이어서 시도(일치 확인) 전부 실제 `train.py` 서브프로세스로 확인
+- `PP_CONFIG_PATH`(전처리 탭) 절대경로 확인, 탭 8/9 폴더 필드가 `CONFIG_KEYS`에 포함됨을 확인
+- 탭 8/9 폴더 override가 실제로 임의 폴더를 읽는지는 `python tests/test_rectify.py`
+  (`gui.cut_rectify` 부분)와 `evaluation/evaluate.py::run_evaluation`의 `fake_dir`/`real_a_dir`
+  파라미터 경로로 확인

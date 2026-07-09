@@ -22,8 +22,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+import inspect
+
 from evaluation.hparam_search import (
-    canonicalize, sample_trials, trial_sig, hparam_search, load_best,
+    canonicalize, sample_trials, trial_sig, hparam_search, load_best, DEFAULT_SPACE,
 )
 
 
@@ -57,6 +59,46 @@ def test_canonicalize_and_sampling():
     assert len(t1) == 12 and len(set(sigs)) == 12
     assert sigs == [trial_sig(t) for t in t2]
     print('canonicalize/sampling: OK')
+
+
+def test_default_space_grid():
+    # every lambda gets the SAME 3-point grid: off / moderate / full
+    for k in ('lambda_grad', 'lambda_lap', 'lambda_coherence', 'lambda_color'):
+        assert DEFAULT_SPACE[k] == [0.0, 0.5, 1.0], (k, DEFAULT_SPACE[k])
+    # grad_no_blur is a searched on/off toggle (previously missing from the space)
+    assert DEFAULT_SPACE['grad_no_blur'] == [False, True]
+    assert DEFAULT_SPACE['reflector_weighted'] == [False, True]
+    assert DEFAULT_SPACE['saliency_patch_sampling'] == [False, True]
+    print('DEFAULT_SPACE grid (3-point lambdas + grad_no_blur toggle): OK')
+
+    # canonicalize collapses grad_no_blur when both structure lambdas are 0
+    # (nothing to blur/not-blur if the losses that would use it are off)
+    ov = canonicalize({'attention_type': 'none', 'attention_positions': 'enc',
+                       'attention_reduction': 16, 'lambda_grad': 0.0, 'lambda_lap': 0.0,
+                       'lambda_coherence': 0.0, 'lambda_color': 0.0,
+                       'reflector_boost': 5.0, 'reflector_weighted': True,
+                       'saliency_patch_sampling': False, 'grad_no_blur': True})
+    assert ov['grad_no_blur'] is False
+    # but survives when a structure lambda is active
+    ov2 = canonicalize({'attention_type': 'none', 'attention_positions': 'enc',
+                        'attention_reduction': 16, 'lambda_grad': 1.0, 'lambda_lap': 0.0,
+                        'lambda_coherence': 0.0, 'lambda_color': 0.0,
+                        'reflector_boost': 3.0, 'reflector_weighted': False,
+                        'saliency_patch_sampling': False, 'grad_no_blur': True})
+    assert ov2['grad_no_blur'] is True
+    print('grad_no_blur canonicalisation (collapses only when unused): OK')
+
+    # a larger sample from the (now much bigger) space still yields that many
+    # distinct trials without exhausting the dedup budget
+    big = sample_trials(n_trials=30, seed=7)
+    assert len(big) == 30 and len({trial_sig(t) for t in big}) == 30
+    print('sampling scales with the expanded search space (30 distinct trials): OK')
+
+
+def test_default_top_k_is_5():
+    sig = inspect.signature(hparam_search)
+    assert sig.parameters['top_k'].default == 5, sig.parameters['top_k'].default
+    print('hparam_search default top_k=5: OK')
 
 
 def _make_dataset(root, n=3, size=64):
@@ -137,6 +179,8 @@ def test_end_to_end_and_resume():
 
 def main():
     test_canonicalize_and_sampling()
+    test_default_space_grid()
+    test_default_top_k_is_5()
     test_end_to_end_and_resume()
     print('\nAll hparam-search smoke tests passed.')
 

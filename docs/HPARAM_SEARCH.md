@@ -27,18 +27,23 @@
 
 | 파라미터 | 후보 |
 |---|---|
-| `attention_type` | none / coord / cbam |
+| `attention_type` | none / coord / cbam / eca / self / cbam_coord |
 | attention 위치 | enc / enc+res / enc+res+dec |
 | `attention_reduction` | 8 / 16 |
-| `lambda_grad` | 0 / 1.0 |
-| `lambda_lap` | 0 / 0.5 |
-| `lambda_coherence` | 0 / 0.5 |
-| `lambda_color` | 0 / 1.0 |
+| `lambda_grad` | **0 / 0.5 / 1.0** |
+| `lambda_lap` | **0 / 0.5 / 1.0** |
+| `lambda_coherence` | **0 / 0.5 / 1.0** |
+| `lambda_color` | **0 / 0.5 / 1.0** |
 | `reflector_boost` | 3 / 5 |
 | `reflector_weighted` | off / on |
 | `saliency_patch_sampling` | off / on |
+| `grad_no_blur` | off / on |
 
-전체 그리드는 수백 가지이므로 **랜덤 샘플링으로 N개**(기본 12)를 뽑습니다. `netG`(resnet/hrnet), crop_size 등 **탭 1~5의 나머지 설정은 그대로 기본값**으로 모든 trial에 적용됩니다 — 백본을 비교하고 싶으면 netG를 바꿔 탐색을 두 번 돌리고 CSV를 비교하세요.
+**모든 `lambda_*`가 동일한 3단계(0 / 0.5 / 1.0)** 를 씁니다 — 손실 항목마다 그리드가 달라 비교가 왜곡되는 걸 막기 위함입니다. on/off 토글(`reflector_weighted`, `saliency_patch_sampling`, `grad_no_blur`)도 각각 독립적으로 켜짐/꺼짐 두 경우 모두 탐색 대상입니다.
+
+전체 그리드는 수만 가지이므로 **랜덤 샘플링으로 N개**(기본 12)를 뽑습니다. `netG`(resnet/hrnet), crop_size 등 **탭 1~5의 나머지 설정은 그대로 기본값**으로 모든 trial에 적용됩니다 — 백본을 비교하고 싶으면 netG를 바꿔 탐색을 두 번 돌리고 CSV를 비교하세요.
+
+**의미 없는 조합은 자동으로 접힘(canonicalize)**: `attention_type=none`일 때 위치/reduction은 무시, `lambda_grad=lambda_lap=0`일 때 `reflector_weighted`와 `grad_no_blur`는 자동으로 off로 접혀 같은 trial을 중복 실행하지 않습니다.
 
 코드에서 공간을 바꾸려면:
 ```python
@@ -56,8 +61,9 @@ space = dict(DEFAULT_SPACE, lambda_grad=[0.0, 0.5, 1.0, 2.0])
 ## 예상 시간 (RTX 5080, 256px 기준 대략)
 
 - trial당: 300장×15epoch ≈ 4,500 iter 학습 + 100장 추론 + 평가 → **수 분~10분대**
-- 기본 설정(12 trial + 상위 3개 이어학습) → **한나절~하룻밤**
+- 기본 설정(12 trial + **stage1 상위 5개** 이어학습) → **한나절~하룻밤**
 - 더 빠르게: stage1 장수/epoch을 줄이거나 trial 수를 줄이세요. 단 stage1이 너무 짧으면(< ~10 epoch) 랭킹 신뢰도가 떨어집니다.
+- 탐색 공간이 커진 만큼(3단계 lambda × on/off 토글들), 커버리지를 높이고 싶으면 `n_trials`(후보 trial 수)를 12보다 늘리는 것도 고려하세요.
 
 ## 주의
 

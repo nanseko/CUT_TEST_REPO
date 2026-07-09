@@ -66,7 +66,7 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 # up to date (printed on launch and shown in the UI header). If the version you
 # see in the browser/console does not match the latest, you are running an old
 # copy and must replace gui.py / preprocessing/.
-BUILD = '2026-07-08.2 (config-persistence+per-checkpoint-hparams)'
+BUILD = '2026-07-08.3 (rectify-fix+per-tab-folders+hparam-grid-expand)'
 
 
 # --------------------------------------------------------------------------- #
@@ -113,6 +113,10 @@ CONFIG_KEYS = [
     'attention_encoder', 'attention_resblocks', 'attention_decoder',
     # HRNet params (only used when netG == hrnet)
     'hrnet_branches', 'hrnet_modules', 'hrnet_blocks',
+    # 8/9. Per-tab data-folder overrides (persisted like everything else above;
+    # empty string = auto-derive from results_dir/name/test_<epoch> as before)
+    'eval_eo_dir', 'eval_real_b_dir', 'eval_fake_dir', 'eval_real_a_dir',
+    'rectify_input_dir',
 ]
 
 DEFAULTS = {
@@ -164,6 +168,11 @@ DEFAULTS = {
     'hrnet_branches': 3,
     'hrnet_modules': 3,
     'hrnet_blocks': 2,
+    'eval_eo_dir': './datasets/Optical/trainB',
+    'eval_real_b_dir': '',
+    'eval_fake_dir': '',
+    'eval_real_a_dir': '',
+    'rectify_input_dir': '',
 }
 
 IMAGE_EXTS = ('*.png', '*.jpg', '*.jpeg', '*.bmp', '*.tif', '*.tiff')
@@ -917,24 +926,37 @@ def run_inference(num_test, epoch, *cfg_values):
         yield ('추론 중 예외 발생:\n' + traceback.format_exc(), gallery)
 
 
-def cut_rectify(epoch, min_area, max_area_frac, min_rectangularity, *cfg_values):
+def cut_rectify(epoch, min_area, max_area_frac, min_rectangularity, input_dir_override,
+                *cfg_values):
     """Deterministic post-processing: snap candidate rigid-object regions in
-    fake_B to straight-sided rectangles/polygons (classical CV, guarantees
-    exact geometry — unlike the learned coherence_loss). Reads fake_B from the
-    same test_<epoch> output as '7. 추론/테스트' / '8. 모델 평가'."""
+    fake_B (or any folder the user points at) to straight-sided rectangles/
+    polygons (classical CV, guarantees exact geometry — unlike the learned
+    coherence_loss). Defaults to the same test_<epoch> fake_B output as
+    '7. 추론/테스트' / '8. 모델 평가', but `input_dir_override` lets the user
+    analyse ANY folder (e.g. trainB, testB, a different results_dir) instead."""
     cfg = _cfg_from_values(cfg_values)
-    fake_dir = os.path.join(str(cfg['results_dir']), str(cfg['name']), f'test_{epoch}', 'images', 'fake_B')
-    if not os.path.isdir(fake_dir):
-        return f'오류: fake_B 폴더가 없습니다: {fake_dir}\n먼저 "7. 추론/테스트" 를 실행하세요.', []
+    input_dir = (str(input_dir_override).strip() if input_dir_override else '') or \
+        os.path.join(str(cfg['results_dir']), str(cfg['name']), f'test_{epoch}', 'images', 'fake_B')
+    if not os.path.isdir(input_dir):
+        return (f'오류: 폴더가 없습니다: {input_dir}\n'
+                f'(기본값은 "7. 추론/테스트" 결과의 fake_B 폴더입니다 — 먼저 추론을 실행하거나, '
+                f'위 "입력 폴더 직접 지정"에 분석할 폴더를 지정하세요.)', [])
     out_dir = os.path.join(str(cfg['results_dir']), str(cfg['name']), f'test_{epoch}', 'rectified')
     try:
         import evaluation as EV
-        csv_path, n = EV.rectify_folder(
-            fake_dir, out_dir, min_area=float(min_area or 16),
+        csv_path, n, n_ok, n_fail, failures = EV.rectify_folder(
+            input_dir, out_dir, min_area=float(min_area or 16),
             max_area_frac=float(max_area_frac or 0.25),
             min_rectangularity=float(min_rectangularity or 0.85))
         gallery = list_images(out_dir)
-        return (f'✅ 완료: 사각형 {n}개 검출 → {out_dir}\n좌표/크기: {csv_path}', gallery[:24])
+        if n_ok == 0 and n_fail > 0:
+            detail = '\n'.join(f'  - {name}: {err}' for name, err in failures)
+            return (f'❌ 처리 실패: {input_dir} 의 이미지 {n_fail}개 전부 실패했습니다.\n{detail}', [])
+        msg = f'✅ 완료: {input_dir} · {n_ok}장 처리, 사각형 {n}개 검출 → {out_dir}\n좌표/크기: {csv_path}'
+        if n_fail:
+            detail = '\n'.join(f'  - {name}: {err}' for name, err in failures)
+            msg += f'\n⚠️ {n_fail}장 실패:\n{detail}'
+        return (msg, gallery[:24])
     except ImportError as exc:
         return f'오류: {exc}', []
     except Exception:
@@ -959,7 +981,7 @@ def cut_hparam_search(out_dir, n_trials, s1_epochs, s2_epochs, top_k, s1_images,
                 cfg, build_train_cmd, build_test_cmd,
                 out_dir or './hparam_search',
                 n_trials=int(n_trials or 12), stage1_epochs=int(s1_epochs or 15),
-                stage2_epochs=int(s2_epochs or 45), top_k=int(top_k or 3),
+                stage2_epochs=int(s2_epochs or 45), top_k=int(top_k or 5),
                 stage1_images=int(s1_images or 300), stage2_images=int(s2_images or 0),
                 num_test=int(num_test or 100), primary=primary,
                 eo_dir=(eo_dir or None), inception_weights=(incw or None),
@@ -996,11 +1018,14 @@ def eval_table_rows(results_dir, name):
 
 
 def cut_evaluate(epoch, experiment, notes, eo_dir, compute_identity, real_b_dir,
-                 inception_weights, fid_max, quality_max, struct_max, *cfg_values):
+                 inception_weights, fid_max, quality_max, struct_max,
+                 fake_dir_override, real_a_dir_override, *cfg_values):
     """One-button CUT output evaluation (FID/KID vs EO, structure vs real_A,
-    optional identity-path vs G(real_B), no-reference quality). Reads outputs
-    already produced by '7. 추론/테스트' (test.py) and logs a comparison row
-    under <results_dir>/<name>/eval_logs/eval_results.csv."""
+    optional identity-path vs G(real_B), no-reference quality). By default
+    reads outputs already produced by '7. 추론/테스트' (test.py);
+    fake_dir_override/real_a_dir_override let the user point at any other
+    folder pair instead. Logs a comparison row under
+    <results_dir>/<name>/eval_logs/eval_results.csv."""
     import evaluation as EV
     cfg = _cfg_from_values(cfg_values)
     epoch = (epoch or 'latest').strip() or 'latest'
@@ -1013,7 +1038,9 @@ def cut_evaluate(epoch, experiment, notes, eo_dir, compute_identity, real_b_dir,
                 compute_identity=bool(compute_identity), real_b_dir=(real_b_dir or None),
                 inception_weights=(inception_weights or None),
                 fid_max=int(fid_max or 500), quality_max=int(quality_max or 0),
-                struct_max=int(struct_max or 0)):
+                struct_max=int(struct_max or 0),
+                fake_dir=(str(fake_dir_override).strip() or None) if fake_dir_override else None,
+                real_a_dir=(str(real_a_dir_override).strip() or None) if real_a_dir_override else None):
             last = line
             yield last, eval_table_rows(cfg['results_dir'], cfg['name'])
     except Exception:
@@ -1474,7 +1501,10 @@ def _pp_config_from_steps(input_dir, output_dir, max_items, recursive, shuffle, 
     }
 
 
-PP_CONFIG_PATH = './preproc_config.json'
+# see DEFAULT_CONFIG_PATH's comment: must be absolute (anchored to gui.py's own
+# location), not CWD-relative, or preprocessing folder settings silently
+# "reset" whenever gui.py happens to be launched from a different directory.
+PP_CONFIG_PATH = os.path.join(REPO_ROOT, 'preproc_config.json')
 
 
 def pp_load_settings():
@@ -1804,6 +1834,10 @@ def build_ui():
 
             pp_io_inputs = [pp_steps, pp_in, pp_out, pp_max, pp_recursive, pp_shuffle, pp_workers]
             pp_save_btn.click(pp_save_btn_fn, inputs=pp_io_inputs, outputs=pp_save_msg)
+            # auto-save: editing the folder/scan fields immediately persists the
+            # full preprocessing config (same rationale as the main auto-save).
+            for _pp_widget in (pp_in, pp_out, pp_max, pp_recursive, pp_shuffle, pp_workers):
+                _pp_widget.change(pp_save_btn_fn, inputs=pp_io_inputs, outputs=pp_save_msg)
 
             with gr.Accordion('④ Optical 사전 히스토그램 학습/저장 (preset 모드용)', open=True):
                 gr.Markdown(
@@ -1901,6 +1935,13 @@ def build_ui():
 
         # ---- Tab 3 : Basic training params ----------------------------- #
         with gr.Tab('3. 기본 학습 파라미터'):
+            train_dataroot_mirror = gr.Textbox(
+                cfg['dataroot'],
+                label='학습 데이터 폴더 (dataroot) — 탭 1과 동일한 값. 여기서 바꿔도 됩니다.')
+            gr.Markdown('ℹ️ 탭 1에서 이미 지정했다면 그대로 두세요. 이 필드를 바꾸면 탭 1의 값도 함께 갱신·저장됩니다 '
+                       '(반대로 탭 1에서 바꾼 값은 페이지를 새로고침해야 여기 표시에 반영됩니다).')
+            train_dataroot_mirror.change(lambda v: gr.update(value=v),
+                                         inputs=[train_dataroot_mirror], outputs=[comp['dataroot']])
             with gr.Row():
                 comp['CUT_mode'] = gr.Dropdown(['CUT', 'FastCUT'], value=cfg['CUT_mode'], label='CUT_mode')
                 comp['n_epochs'] = gr.Number(cfg['n_epochs'], label='n_epochs (고정 lr)', precision=0)
@@ -2044,20 +2085,6 @@ def build_ui():
                                                       comp['attention_resblocks'],
                                                       comp['attention_decoder']])
 
-        # Ordered input list shared by every Save / Start / Inference button
-        ordered_inputs = [comp[k] for k in CONFIG_KEYS]
-
-        save_basic.click(do_save, inputs=[cfg_path] + ordered_inputs, outputs=save_basic_out)
-        save_cut.click(do_save, inputs=[cfg_path] + ordered_inputs, outputs=save_cut_out)
-        save_att.click(do_save, inputs=[cfg_path] + ordered_inputs, outputs=save_att_out)
-
-        # Auto-save: any field on any tab writes the FULL current config to
-        # disk immediately (not just the fields on that tab), so values never
-        # need a manual "저장" click to survive a server restart. Each widget's
-        # .change fires the same do_save with the full current value set.
-        for _widget in ordered_inputs:
-            _widget.change(do_save, inputs=[cfg_path] + ordered_inputs, outputs=autosave_status)
-
         # fill nce_layers with the recommended taps for the current architecture
         nce_reco_btn.click(
             gui_recommend_nce,
@@ -2087,8 +2114,6 @@ def build_ui():
             ckpt_load_msg = gr.Textbox(label='불러오기 결과', interactive=False)
             ckpt_refresh_btn.click(refresh_checkpoint_dropdown, inputs=[comp['checkpoints_dir']],
                                    outputs=[ckpt_picker])
-            ckpt_load_btn.click(cfg_apply_checkpoint, inputs=[comp['checkpoints_dir'], ckpt_picker],
-                                outputs=[ckpt_load_msg] + ordered_inputs)
             gr.Markdown(
                 'ℹ️ **행(hang) 자동 복구** — 장시간(1~2일) 학습 중 프로세스가 죽지 않은 채 멈추는 경우'
                 '(DataLoader 정지, GPU/드라이버 행, 네트워크 드라이브 I/O 정지 등)를 대비해, 아래 시간 동안'
@@ -2116,9 +2141,6 @@ def build_ui():
             st_graph = gr.Image(label='손실 곡선 (loss_curve.png)', interactive=False, type='filepath')
 
             monitor_outputs = [st_epoch, st_iters, st_lr, st_msg, st_loss, st_log, st_graph]
-            start_btn.click(start_training,
-                            inputs=[cfg_path, stall_minutes, max_restarts] + ordered_inputs,
-                            outputs=monitor_outputs)
             stop_btn.click(stop_training, outputs=st_msg)
 
         # ---- Tab 7 : Inference ----------------------------------------- #
@@ -2134,9 +2156,6 @@ def build_ui():
             inf_status = gr.Textbox(label='진행 상황', lines=6, interactive=False)
             inf_gallery = gr.Gallery(label='변환 결과 (fake_B)', columns=4, height='auto')
 
-            inf_btn.click(run_inference,
-                          inputs=[inf_num, inf_epoch] + ordered_inputs,
-                          outputs=[inf_status, inf_gallery])
 
         # ---- Tab 8 : Model evaluation (CUT outputs) --------------------- #
         with gr.Tab('8. 모델 평가 (CUT 출력)'):
@@ -2153,11 +2172,17 @@ def build_ui():
                 eval_exp = gr.Textbox('', label='실험명 (비워두면 name 사용, 예: hrnet_coord_lgrad1.0)')
             eval_notes = gr.Textbox('', label='메모 (선택)')
             with gr.Row():
-                eval_eo = gr.Textbox('./datasets/Optical/trainB', label='EO(광학) 참조 폴더 (FID/KID 기준)')
+                comp['eval_eo_dir'] = gr.Textbox(cfg['eval_eo_dir'], label='EO(광학) 참조 폴더 (FID/KID 기준)')
                 eval_incw = gr.Textbox('', label='InceptionV3 가중치 .pth 경로 (오프라인용, 비우면 자동탐색)')
             with gr.Row():
                 eval_id_on = gr.Checkbox(True, label='Identity 평가(idt_B 생성, 탭4/5 설정과 동일한 체크포인트 사용)')
-                eval_real_b = gr.Textbox('', label='real_B 폴더 (비우면 test 결과의 real_B 자동 사용)')
+                comp['eval_real_b_dir'] = gr.Textbox(
+                    cfg['eval_real_b_dir'], label='real_B 폴더 (비우면 test 결과의 real_B 자동 사용)')
+            with gr.Row():
+                comp['eval_fake_dir'] = gr.Textbox(
+                    cfg['eval_fake_dir'], label='fake_B 폴더 직접 지정 (비우면 results_dir/name/test_<epoch> 자동)')
+                comp['eval_real_a_dir'] = gr.Textbox(
+                    cfg['eval_real_a_dir'], label='real_A 폴더 직접 지정 (비우면 자동)')
             with gr.Row():
                 eval_fid_max = gr.Number(500, label='FID/KID 평가 장수', precision=0)
                 eval_struct_max = gr.Number(0, label='구조 평가 장수 (0=전체)', precision=0)
@@ -2169,15 +2194,6 @@ def build_ui():
                                       label='실험별 평가 결과 비교')
             eval_refresh = gr.Button('🔄 비교표 새로고침')
 
-            eval_btn.click(cut_evaluate,
-                          inputs=[eval_epoch, eval_exp, eval_notes, eval_eo,
-                                  eval_id_on, eval_real_b, eval_incw,
-                                  eval_fid_max, eval_qual_max, eval_struct_max] + ordered_inputs,
-                          outputs=[eval_log, eval_table])
-            eval_refresh.click(lambda *v: eval_table_rows(_cfg_from_values(v)['results_dir'],
-                                                           _cfg_from_values(v)['name']),
-                               inputs=ordered_inputs, outputs=eval_table)
-
         # ---- Tab 9 : Deterministic rectification (post-processing) ------ #
         with gr.Tab('9. 형상 후처리 (직사각 스냅)'):
             gr.Markdown(
@@ -2185,22 +2201,22 @@ def build_ui():
                 '(`cv2.minAreaRect`)/단순화 다각형으로 스냅합니다. 학습된 `lambda_coherence`(탭 4)와 달리 '
                 '**90도 직각을 기하학적으로 보장**하지만, 사실적인 텍스처가 아니라 벡터 도형처럼 보입니다. '
                 '사진 같은 결과가 아니라 **형상 추출/판독**(건물 footprint, 선박 크기·방위)이 목적일 때 사용하세요.\n\n'
-                '- 원형/불규칙 블롭(원형도가 낮은 객체)은 자동으로 제외됩니다 (사각형이 아닌 걸 억지로 사각형화하지 않음).')
+                '- 원형/불규칙 블롭(원형도가 낮은 객체)은 자동으로 제외됩니다 (사각형이 아닌 걸 억지로 사각형화하지 않음).\n'
+                '- ⚠️ opencv가 설치되어 있어야 동작합니다(`pip install opencv-python`). 미설치 시 명확한 오류 메시지가 표시됩니다.')
+            comp['rectify_input_dir'] = gr.Textbox(
+                cfg['rectify_input_dir'],
+                label='입력 폴더 직접 지정 (비우면 기본값: results_dir/name/test_<epoch>/images/fake_B)')
             with gr.Row():
-                rect_epoch = gr.Textbox('latest', label='epoch (테스트에 사용한 값과 동일하게)')
+                rect_epoch = gr.Textbox('latest', label='epoch (입력 폴더를 직접 지정하면 무시됨)')
             with gr.Row():
                 rect_min_area = gr.Number(16, label='최소 영역 크기 (px², 노이즈 제거)')
                 rect_max_frac = gr.Number(0.25, label='최대 영역 비율 (이미지 대비, 배경 제외)')
                 rect_min_rectangularity = gr.Number(
                     0.85, label='최소 사각형도 (0~1, 원은 이론상 최대 0.785)')
             rect_btn = gr.Button('▶ 형상 후처리 실행', variant='primary')
-            rect_status = gr.Textbox(label='결과', lines=4, interactive=False)
+            rect_status = gr.Textbox(label='결과', lines=6, interactive=False)
             rect_gallery = gr.Gallery(label='검출된 사각형 오버레이 (초록=사각형, 빨강=단순화 다각형)',
                                       columns=4, height='auto')
-            rect_btn.click(cut_rectify,
-                          inputs=[rect_epoch, rect_min_area, rect_max_frac, rect_min_rectangularity]
-                                 + ordered_inputs,
-                          outputs=[rect_status, rect_gallery])
 
         # ---- Tab 10 : Hyperparameter auto-search (Successive Halving) --- #
         with gr.Tab('10. 하이퍼파라미터 자동 탐색'):
@@ -2219,7 +2235,7 @@ def build_ui():
                                           label='랭킹 지표 (SAR→EO는 fid 권장, EO 없으면 자동 epi 전환)')
             with gr.Row():
                 hps_n = gr.Number(12, label='후보 trial 수', precision=0)
-                hps_topk = gr.Number(3, label='stage2 진출 상위 K', precision=0)
+                hps_topk = gr.Number(5, label='stage2 진출 상위 K', precision=0)
                 hps_s1ep = gr.Number(15, label='stage1 epoch', precision=0)
                 hps_s2ep = gr.Number(45, label='stage2 추가 epoch', precision=0)
             with gr.Row():
@@ -2235,13 +2251,56 @@ def build_ui():
                 hps_apply_btn = gr.Button('🧬 최적 설정을 탭 4/5에 적용')
                 hps_apply_msg = gr.Textbox(label='적용 결과', lines=3, interactive=False)
 
-            hps_btn.click(cut_hparam_search,
-                          inputs=[hps_out, hps_n, hps_s1ep, hps_s2ep, hps_topk,
-                                  hps_s1img, hps_s2img, hps_ntest, hps_primary,
-                                  hps_eo, hps_incw] + ordered_inputs,
-                          outputs=hps_log)
             hps_apply_btn.click(hps_apply_best, inputs=[hps_out],
                                 outputs=[hps_apply_msg] + [comp[k] for k in HPS_APPLY_KEYS])
+
+        # ------------------------------------------------------------------ #
+        # Wiring that needs `ordered_inputs` (all CONFIG_KEYS widgets, incl.
+        # ones defined in tabs 8/9 above) — must come after every tab is
+        # built, since Python needs every comp[...] entry to exist first.
+        # Widget LAYOUT stays in each tab's own `with gr.Tab(...)` block above;
+        # only the event WIRING lives here (Gradio doesn't require them to be
+        # textually co-located with the widgets they connect).
+        # ------------------------------------------------------------------ #
+        ordered_inputs = [comp[k] for k in CONFIG_KEYS]
+
+        save_basic.click(do_save, inputs=[cfg_path] + ordered_inputs, outputs=save_basic_out)
+        save_cut.click(do_save, inputs=[cfg_path] + ordered_inputs, outputs=save_cut_out)
+        save_att.click(do_save, inputs=[cfg_path] + ordered_inputs, outputs=save_att_out)
+
+        # Auto-save: any field on any tab writes the FULL current config to
+        # disk immediately (not just the fields on that tab), so values never
+        # need a manual "저장" click to survive a server restart. Each widget's
+        # .change fires the same do_save with the full current value set.
+        for _widget in ordered_inputs:
+            _widget.change(do_save, inputs=[cfg_path] + ordered_inputs, outputs=autosave_status)
+
+        ckpt_load_btn.click(cfg_apply_checkpoint, inputs=[comp['checkpoints_dir'], ckpt_picker],
+                            outputs=[ckpt_load_msg] + ordered_inputs)
+        start_btn.click(start_training,
+                        inputs=[cfg_path, stall_minutes, max_restarts] + ordered_inputs,
+                        outputs=monitor_outputs)
+        inf_btn.click(run_inference,
+                      inputs=[inf_num, inf_epoch] + ordered_inputs,
+                      outputs=[inf_status, inf_gallery])
+        eval_btn.click(cut_evaluate,
+                      inputs=[eval_epoch, eval_exp, eval_notes, comp['eval_eo_dir'],
+                              eval_id_on, comp['eval_real_b_dir'], eval_incw,
+                              eval_fid_max, eval_qual_max, eval_struct_max,
+                              comp['eval_fake_dir'], comp['eval_real_a_dir']] + ordered_inputs,
+                      outputs=[eval_log, eval_table])
+        eval_refresh.click(lambda *v: eval_table_rows(_cfg_from_values(v)['results_dir'],
+                                                       _cfg_from_values(v)['name']),
+                           inputs=ordered_inputs, outputs=eval_table)
+        rect_btn.click(cut_rectify,
+                      inputs=[rect_epoch, rect_min_area, rect_max_frac, rect_min_rectangularity,
+                              comp['rectify_input_dir']] + ordered_inputs,
+                      outputs=[rect_status, rect_gallery])
+        hps_btn.click(cut_hparam_search,
+                      inputs=[hps_out, hps_n, hps_s1ep, hps_s2ep, hps_topk,
+                              hps_s1img, hps_s2img, hps_ntest, hps_primary,
+                              hps_eo, hps_incw] + ordered_inputs,
+                      outputs=hps_log)
 
     return demo
 

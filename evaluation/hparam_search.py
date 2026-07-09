@@ -52,14 +52,17 @@ DEFAULT_SPACE = {
     'attention_type': ['none', 'coord', 'cbam', 'eca', 'self', 'cbam_coord'],
     'attention_positions': ['enc', 'enc+res', 'enc+res+dec'],
     'attention_reduction': [8, 16],
-    # structure / hallucination losses
-    'lambda_grad': [0.0, 1.0],
-    'lambda_lap': [0.0, 0.5],
-    'lambda_coherence': [0.0, 0.5],
-    'lambda_color': [0.0, 1.0],
+    # structure / hallucination losses -- every lambda gets the SAME 3-point
+    # grid (off / moderate / full weight) so sweeps are directly comparable
+    # across loss terms, not biased by an arbitrarily different max per term.
+    'lambda_grad': [0.0, 0.5, 1.0],
+    'lambda_lap': [0.0, 0.5, 1.0],
+    'lambda_coherence': [0.0, 0.5, 1.0],
+    'lambda_color': [0.0, 0.5, 1.0],
     'reflector_boost': [3.0, 5.0],
     'reflector_weighted': [False, True],
     'saliency_patch_sampling': [False, True],
+    'grad_no_blur': [False, True],
 }
 
 _POSITIONS = {
@@ -87,6 +90,7 @@ def canonicalize(overrides):
         ov['attention_encoder'], ov['attention_resblocks'], ov['attention_decoder'] = e, r, d
     if float(ov.get('lambda_grad', 0.0)) == 0.0 and float(ov.get('lambda_lap', 0.0)) == 0.0:
         ov['reflector_weighted'] = False
+        ov['grad_no_blur'] = False   # nothing to blur/not-blur when both are off
     if not ov.get('reflector_weighted') and not ov.get('saliency_patch_sampling') \
             and float(ov.get('lambda_coherence', 0.0)) == 0.0:
         ov['reflector_boost'] = 3.0
@@ -136,6 +140,8 @@ def _fmt_overrides(ov):
         parts.append('rw')
     if ov.get('saliency_patch_sampling'):
         parts.append('sps')
+    if ov.get('grad_no_blur'):
+        parts.append('noblur')
     if ov.get('reflector_weighted') or ov.get('saliency_patch_sampling') \
             or float(ov.get('lambda_coherence', 0.0)) > 0:
         parts.append(f'b{ov.get("reflector_boost", 3.0):g}')
@@ -185,7 +191,7 @@ def _stream_subprocess(cmd, cwd, log, tag, holder):
 
 def hparam_search(base_cfg, build_train_cmd, build_test_cmd, out_dir,
                   space=None, n_trials=12, stage1_epochs=15, stage2_epochs=45,
-                  top_k=3, stage1_images=300, stage2_images=0, num_test=100,
+                  top_k=5, stage1_images=300, stage2_images=0, num_test=100,
                   primary='fid', eo_dir=None, inception_weights=None,
                   fid_max=300, repo_root=None, seed=42):
     """Generator yielding log strings. Writes hparam_results.csv (resumable)

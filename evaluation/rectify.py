@@ -134,36 +134,62 @@ def rectify_image(image_path_or_array, min_area=16, max_area_frac=0.25,
 
 
 def rectify_folder(input_dir, output_dir, min_area=16, max_area_frac=0.25,
-                   min_rectangularity=0.85, poly_epsilon_frac=0.02, log=None):
+                   min_rectangularity=0.85, poly_epsilon_frac=0.02, log=None,
+                   recursive=False, max_items=0):
     """Run rectify_image on every image in input_dir; saves an overlay PNG per
     image to output_dir plus a summary CSV of detected rectangle geometries
-    (image, cx, cy, w, h, angle_deg, rectangularity). Returns the CSV path.
+    (image, cx, cy, w, h, angle_deg, rectangularity).
+
+    Returns (csv_path, n_regions, n_processed, n_failed, failures) where
+    `failures` is a list of (filename, error message) for the first few
+    failures. Per-file errors are NOT silently swallowed: each one is counted,
+    reported via `log` (if given), and returned so the caller can surface a
+    clear "N/M failed: <reason>" status instead of an misleadingly-successful
+    "0 detected" when e.g. every single file failed to even open.
     """
     import csv
     from PIL import Image
     from preprocessing.pipeline import scan_images
 
+    _require_cv2()   # fail fast & once, with ONE clear message, instead of
+                     # every file raising (and being caught) the same ImportError
+
     os.makedirs(output_dir, exist_ok=True)
-    files = scan_images(input_dir, recursive=False, shuffle=False, seed=42)
+    files = scan_images(input_dir, recursive=recursive, shuffle=False, seed=42,
+                        max_items=int(max_items or 0))
     csv_path = os.path.join(output_dir, 'rectangles.csv')
     n_regions = 0
+    n_processed = 0
+    failures = []
+    if not files:
+        if log:
+            log(f'⚠️ 입력 폴더에서 이미지를 찾지 못했습니다: {input_dir}')
+        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+            csv.writer(f).writerow(['image', 'cx', 'cy', 'width', 'height', 'angle_deg', 'rectangularity'])
+        return csv_path, 0, 0, 0, []
+
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f)
         w.writerow(['image', 'cx', 'cy', 'width', 'height', 'angle_deg', 'rectangularity'])
         for i, p in enumerate(files):
+            name = os.path.basename(p)
             try:
                 overlay, regions = rectify_image(
                     p, min_area=min_area, max_area_frac=max_area_frac,
                     min_rectangularity=min_rectangularity, poly_epsilon_frac=poly_epsilon_frac)
-                name = os.path.basename(p)
                 Image.fromarray(overlay).save(os.path.join(output_dir, name))
                 for r in regions:
                     (cx, cy), (rw, rh), ang = r['rect']
                     w.writerow([name, round(cx, 1), round(cy, 1), round(rw, 1), round(rh, 1),
                                round(ang, 1), round(r['rectangularity'], 3)])
                     n_regions += 1
-            except Exception:
+                n_processed += 1
+            except Exception as exc:
+                failures.append((name, str(exc)))
+                if log and len(failures) <= 5:
+                    log(f'⚠️ {name} 처리 실패: {exc}')
                 continue
             if log and ((i + 1) % 20 == 0 or i == len(files) - 1):
-                log(f'후처리 {i+1}/{len(files)}  (검출된 사각형 누적 {n_regions}개)')
-    return csv_path, n_regions
+                log(f'후처리 {i+1}/{len(files)}  (성공 {n_processed}, 실패 {len(failures)}, '
+                    f'검출된 사각형 누적 {n_regions}개)')
+    return csv_path, n_regions, n_processed, len(failures), failures[:5]

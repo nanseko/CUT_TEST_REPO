@@ -82,6 +82,10 @@ overlay, regions = EV.rectify_image('fake_B/000.png', min_rectangularity=0.85)
 
 opencv 필요: `pip install opencv-python` (또는 `opencv-python-headless`). 없으면 명확한 오류 메시지와 함께 건너뜁니다.
 
+**GUI 탭 9 사용법**: 기본은 `results_dir/name/test_<epoch>/images/fake_B`를 분석하지만, **"입력 폴더 직접 지정"** 에 원하는 폴더를 입력하면 (trainB, testB, 다른 결과 폴더 등) **그 폴더의 모든 이미지**를 분석합니다. 비워두면 기존처럼 자동으로 결정됩니다.
+
+> **⚠️ 과거 버그(수정됨)**: opencv가 설치되어 있지 않으면 폴더의 **모든 이미지**에서 조용히 예외가 발생해 삼켜졌고("한 파일만 확인하는 것처럼" 보이거나 아예 아무 결과도 안 나옴), GUI는 이를 구분 못 하고 "✅ 완료: 사각형 0개 검출"이라는 **오해의 소지가 있는 성공 메시지**를 보여줬습니다. 지금은 opencv 부재를 **한 번에 즉시** 감지해 명확한 오류로 표시하고, 파일별 실패도 개수와 사유가 함께 보고됩니다(`n_processed`/`n_failed`/`failures`). 검증: `python tests/test_rectify.py`.
+
 ### 어느 걸 써야 하나
 
 | | ① lambda_coherence | ② 결정론적 후처리 |
