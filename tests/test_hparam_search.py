@@ -177,11 +177,86 @@ def test_end_to_end_and_resume():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_stalled_trial_does_not_block_the_whole_search():
+    """The bug this closes: a single hung trial (stuck DataLoader, GPU hang,
+    ...) used to block the ENTIRE multi-hour hparam search forever, because
+    _stream_subprocess had no stall timeout. One trial is rigged to hang
+    (via a fake build_train_cmd that swaps in a script that sleeps forever
+    instead of real train.py); the other runs REAL tiny train.py/test.py
+    (same as test_end_to_end_and_resume) so the normal scoring path is still
+    genuinely exercised. Must: (1) not hang -- bounded wall-clock time,
+    (2) mark the stalled trial 'failed' in the CSV and move on,
+    (3) still rank/complete using the surviving trial.
+    """
+    import gui
+    import textwrap
+
+    tmp = tempfile.mkdtemp()
+    try:
+        data = os.path.join(tmp, 'data')
+        _make_dataset(data)
+        base = dict(gui.DEFAULTS)
+        base.update(dataroot=data, name='unused', checkpoints_dir=os.path.join(tmp, 'ck'),
+                   results_dir=os.path.join(tmp, 'res'), gpu_ids='-1', batch_size=1,
+                   load_size=64, crop_size=64, num_threads=0)
+        out = os.path.join(tmp, 'hps_stall')
+
+        hang_script = os.path.join(tmp, 'hang.py')
+        with open(hang_script, 'w', encoding='utf-8') as f:
+            f.write(textwrap.dedent('''
+                import time
+                print("(epoch: 1, iters: 1) G: 1.0", flush=True)
+                time.sleep(3600)
+            '''))
+
+        # lambda_grad=1.0 -> the "cursed" trial that hangs; lambda_grad=0.0 -> real training
+        def fake_build_train_cmd(cfg):
+            if float(cfg.get('lambda_grad', 0.0)) == 1.0:
+                return [sys.executable, '-u', hang_script]
+            return gui.build_train_cmd(cfg)
+
+        stall_space = dict(TINY_SPACE)   # lambda_grad: [0.0, 1.0] -> exactly 2 trials
+
+        # NOTE: evaluation/__init__.py does `from evaluation.hparam_search import
+        # hparam_search`, which shadows the `evaluation.hparam_search` SUBMODULE
+        # attribute on the `evaluation` package with the function of the same
+        # name -- so `import evaluation.hparam_search as hs` resolves to the
+        # function, not the module. Go through sys.modules directly instead.
+        hs = sys.modules['evaluation.hparam_search']
+        orig_min_stall = hs.MIN_STALL_SECONDS
+        hs.MIN_STALL_SECONDS = 1
+        try:
+            t0 = time.time()
+            last = None
+            for line in hparam_search(base, fake_build_train_cmd, gui.build_test_cmd, out,
+                                      space=stall_space, n_trials=4, stage1_epochs=1,
+                                      stage2_epochs=1, top_k=1, stage1_images=3,
+                                      stage2_images=0, num_test=2, primary='epi',
+                                      eo_dir=None, stall_minutes=0.2):
+                last = line
+            dt = time.time() - t0
+        finally:
+            hs.MIN_STALL_SECONDS = orig_min_stall
+
+        assert dt < 90, f'a hung trial must not block the whole search, took {dt:.1f}s'
+        rows = list(csv.DictReader(open(os.path.join(out, 'hparam_results.csv'), encoding='utf-8')))
+        statuses = {row['overrides']: row['status'] for row in rows if row['stage'] == '1'}
+        n_ok = sum(1 for s in statuses.values() if s == 'ok')
+        n_failed = sum(1 for s in statuses.values() if s == 'failed')
+        assert n_ok == 1 and n_failed == 1, (n_ok, n_failed, statuses)
+        assert '최적 하이퍼파라미터' in last, last   # search still completed using the survivor
+        print(f'stalled_trial_does_not_block_search: OK (dt={dt:.1f}s, 1 failed + 1 ok, '
+              f'search completed)')
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     test_canonicalize_and_sampling()
     test_default_space_grid()
     test_default_top_k_is_5()
     test_end_to_end_and_resume()
+    test_stalled_trial_does_not_block_the_whole_search()
     print('\nAll hparam-search smoke tests passed.')
 
 

@@ -34,8 +34,6 @@ import argparse
 import datetime
 import threading
 import traceback
-import subprocess
-import queue
 
 import gradio as gr
 
@@ -66,7 +64,7 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 # up to date (printed on launch and shown in the UI header). If the version you
 # see in the browser/console does not match the latest, you are running an old
 # copy and must replace gui.py / preprocessing/.
-BUILD = '2026-07-08.3 (rectify-fix+per-tab-folders+hparam-grid-expand)'
+BUILD = '2026-07-08.4 (system-wide-subprocess-watchdog)'
 
 
 # --------------------------------------------------------------------------- #
@@ -591,22 +589,36 @@ def build_test_cmd(cfg, num_test, epoch):
 MIN_STALL_SECONDS = 60
 
 
-def _stdout_reader(pipe, q):
-    try:
-        for raw in iter(pipe.readline, ''):
-            q.put(raw)
-    except Exception:
-        pass
-    q.put(None)   # EOF sentinel
+# regex matching any line that counts as "forward progress" for the stall
+# watchdog: a print_freq iteration line, or the once-per-epoch summary line.
+_PROGRESS_RE = re.compile(r'epoch:\s*\d+,\s*iters:\s*\d+|End of epoch')
 
 
 def training_worker(cfg, state, stall_minutes=20, max_restarts=20, backoff_seconds=30):
+    from util.subprocess_watchdog import run_watched
     attempt = 0
     try:
         with state.lock:
             state.total_epochs = int(cfg['n_epochs']) + int(cfg['n_epochs_decay'])
             state.message = '학습 중 (Training)'
-        stall_seconds = max(MIN_STALL_SECONDS, int(float(stall_minutes) * 60))
+
+        def on_line(line):
+            m = _RE_ITER.search(line)
+            if m:
+                with state.lock:
+                    state.epoch = int(m.group(1))
+                    state.iters = int(m.group(2))
+                    state.losses = {k: float(v) for k, v in
+                                    _RE_LOSS.findall(line.split(')', 1)[-1])}
+            ml = _RE_LR.search(line)
+            if ml:
+                with state.lock:
+                    state.lr = float(ml.group(1))
+            state.log(line)
+
+        def on_start(proc):
+            with state.lock:
+                state.proc = proc
 
         while True:
             if state.stop_requested:
@@ -620,81 +632,19 @@ def training_worker(cfg, state, stall_minutes=20, max_restarts=20, backoff_secon
             tag = '' if attempt == 0 else f' [재시작 {attempt}/{max_restarts}]'
             state.log(f'실행 명령{tag}: ' + ' '.join(cmd))
 
-            env = dict(os.environ, PYTHONUNBUFFERED='1')
-            proc = subprocess.Popen(cmd, cwd=REPO_ROOT, stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
-            with state.lock:
-                state.proc = proc
+            result = run_watched(cmd, REPO_ROOT, on_line, stall_minutes=stall_minutes,
+                                 progress_re=_PROGRESS_RE, is_stopped=lambda: state.stop_requested,
+                                 on_start=on_start, min_stall_seconds=MIN_STALL_SECONDS)
+            stalled, rc = result['stalled'], result['rc']
 
-            q = queue.Queue()
-            threading.Thread(target=_stdout_reader, args=(proc.stdout, q), daemon=True).start()
-
-            last_progress = time.time()
-            stalled = False
-            eof = False
-            while True:
-                if state.stop_requested:
-                    proc.terminate()
-                    state.log('사용자 요청으로 학습 중단됨')
-                    with state.lock:
-                        state.message = '중단됨 (Stopped)'
-                    return
-                try:
-                    raw = q.get(timeout=5)
-                except queue.Empty:
-                    raw = ''
-                else:
-                    if raw is None:
-                        eof = True
-                        break
-                    line = raw.rstrip('\n')
-                    if line:
-                        m = _RE_ITER.search(line)
-                        if m:
-                            with state.lock:
-                                state.epoch = int(m.group(1))
-                                state.iters = int(m.group(2))
-                                state.losses = {k: float(v) for k, v in
-                                                _RE_LOSS.findall(line.split(')', 1)[-1])}
-                            last_progress = time.time()
-                        elif 'End of epoch' in line:
-                            last_progress = time.time()
-                        ml = _RE_LR.search(line)
-                        if ml:
-                            with state.lock:
-                                state.lr = float(ml.group(1))
-                        state.log(line)
-                if time.time() - last_progress > stall_seconds:
-                    stalled = True
-                    break
-
-            if stalled:
-                state.log(f'⚠️ {stall_minutes}분 동안 진행 없음(행/hang) 감지 → 프로세스를 강제 종료합니다.')
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-                try:
-                    proc.wait(timeout=30)
-                except Exception:
-                    pass
-                rc = None
-            else:
-                # drain any buffered remaining output before checking the exit code
-                while not eof:
-                    raw = q.get()
-                    if raw is None:
-                        break
-                    line = raw.rstrip('\n')
-                    if line:
-                        state.log(line)
-                rc = proc.wait()
-
-            if state.stop_requested:
+            if result['stopped'] or state.stop_requested:
                 state.log('사용자 요청으로 학습 중단됨')
                 with state.lock:
                     state.message = '중단됨 (Stopped)'
                 return
+
+            if stalled:
+                state.log(f'⚠️ {stall_minutes}분 동안 진행 없음(행/hang) 감지 → 프로세스를 강제 종료합니다.')
 
             if not stalled and rc == 0:
                 state.log('학습 완료' + (f' (재시작 {attempt}회 후)' if attempt else ''))
@@ -884,7 +834,8 @@ def cfg_apply_checkpoint(checkpoints_dir, name):
 # Inference (subprocess test.py + result gallery)
 # --------------------------------------------------------------------------- #
 
-def run_inference(num_test, epoch, *cfg_values):
+def run_inference(num_test, epoch, stall_minutes, *cfg_values):
+    from util.subprocess_watchdog import run_watched_stream
     cfg = _cfg_from_values(cfg_values)
     gallery = []
 
@@ -900,18 +851,19 @@ def run_inference(num_test, epoch, *cfg_values):
     yield ('실행 명령: ' + ' '.join(cmd) + '\n추론 시작...', gallery)
 
     try:
-        env = dict(os.environ, PYTHONUNBUFFERED='1')
-        proc = subprocess.Popen(cmd, cwd=REPO_ROOT, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
         log_lines = []
-        for raw in iter(proc.stdout.readline, ''):
-            line = raw.rstrip('\n')
-            if not line:
-                continue
+        holder = {}
+        for line in run_watched_stream(cmd, REPO_ROOT, holder, stall_minutes=float(stall_minutes or 20),
+                                       min_stall_seconds=MIN_STALL_SECONDS):
             log_lines.append(line)
             if 'processing' in line or 'loading' in line or 'Error' in line or 'Traceback' in line:
                 yield ('\n'.join(log_lines[-15:]), gallery)
-        proc.wait()
+
+        if holder.get('stalled'):
+            yield ('\n'.join(log_lines[-15:]) +
+                  f'\n\n⚠️ {stall_minutes}분 동안 진행 없어 추론 프로세스를 강제 종료했습니다 '
+                  f'(DataLoader 정지/GPU 행 등 의심). 다시 시도해 보세요.', gallery)
+            return
 
         out_dir = os.path.join(str(cfg['results_dir']), str(cfg['name']),
                                f'test_{epoch}', 'images', 'fake_B')
@@ -970,10 +922,14 @@ HPS_APPLY_KEYS = ['attention_type', 'attention_reduction', 'attention_encoder',
 
 
 def cut_hparam_search(out_dir, n_trials, s1_epochs, s2_epochs, top_k, s1_images,
-                      s2_images, num_test, primary, eo_dir, incw, *cfg_values):
+                      s2_images, num_test, primary, eo_dir, incw, stall_minutes,
+                      *cfg_values):
     """One-button Successive-Halving hyperparameter search over attention +
     structure/hallucination loss weights. Short trainings ranked by FID/EPI;
-    winners get more budget via continue_train. Resumable (hparam_results.csv)."""
+    winners get more budget via continue_train. Resumable (hparam_results.csv).
+    Each trial's train.py/test.py runs under the same stall watchdog as the
+    main training tab (util/subprocess_watchdog.py) -- a hung trial is killed
+    and marked failed instead of blocking the entire multi-hour search."""
     cfg = _cfg_from_values(cfg_values)
     try:
         from evaluation.hparam_search import hparam_search
@@ -985,7 +941,7 @@ def cut_hparam_search(out_dir, n_trials, s1_epochs, s2_epochs, top_k, s1_images,
                 stage1_images=int(s1_images or 300), stage2_images=int(s2_images or 0),
                 num_test=int(num_test or 100), primary=primary,
                 eo_dir=(eo_dir or None), inception_weights=(incw or None),
-                repo_root=REPO_ROOT):
+                repo_root=REPO_ROOT, stall_minutes=float(stall_minutes or 20)):
             yield line
     except Exception:
         yield '하이퍼파라미터 탐색 중 예외:\n' + traceback.format_exc()
@@ -2148,10 +2104,13 @@ def build_ui():
             gr.Markdown(
                 '학습된 체크포인트로 `test.py` 를 실행해 `dataroot/testA` 이미지를 변환합니다.\n\n'
                 '- ⚠️ **탭 4/5의 CUT·Attention 설정이 학습 때와 동일**해야 가중치가 올바르게 로드됩니다.\n'
-                '- CUT(unaligned)은 testA 와 testB 폴더가 모두 필요합니다.')
+                '- CUT(unaligned)은 testA 와 testB 폴더가 모두 필요합니다.\n'
+                '- 진행이 멈추면(DataLoader 정지 등) 아래 시간 후 자동으로 프로세스를 종료합니다 '
+                '(재시작은 안 함 — 다시 "▶ 추론 실행"을 눌러 재시도하세요).')
             with gr.Row():
                 inf_num = gr.Number(50, label='num_test (변환 장수)', precision=0)
                 inf_epoch = gr.Textbox('latest', label='epoch (latest 또는 숫자)')
+                inf_stall = gr.Number(20, label='행(hang) 감지 시간 (분)', precision=0)
             inf_btn = gr.Button('▶ 추론 실행', variant='primary')
             inf_status = gr.Textbox(label='진행 상황', lines=6, interactive=False)
             inf_gallery = gr.Gallery(label='변환 결과 (fake_B)', columns=4, height='auto')
@@ -2228,7 +2187,9 @@ def build_ui():
                 '- 탭 1~5의 현재 설정(dataroot/netG/crop 등)이 **기본값**이 되고, 탐색 대상 파라미터만 trial마다 바뀝니다.\n'
                 '- **중단해도 재개 가능**: 완료된 trial은 `hparam_results.csv` 에 기록되어 다시 학습하지 않습니다.\n'
                 '- 예상 시간: trial당 대략 (stage1 장수 × epoch) 학습 + 추론/평가. RTX 5080 기준 '
-                '300장×15ep ≈ 수 분/trial → 12 trial이면 한나절~하룻밤 수준.')
+                '300장×15ep ≈ 수 분/trial → 12 trial이면 한나절~하룻밤 수준.\n'
+                '- ⚙️ **각 trial의 학습/추론도 메인 학습 탭과 동일한 행(hang) watchdog으로 보호**됩니다 — '
+                '한 trial이 멈춰도 전체 탐색이 멈추지 않고, 그 trial만 실패 처리 후 다음으로 넘어갑니다.')
             with gr.Row():
                 hps_out = gr.Textbox('./hparam_search', label='탐색 결과/로그 폴더')
                 hps_primary = gr.Dropdown(['fid', 'epi'], value='fid',
@@ -2245,6 +2206,7 @@ def build_ui():
             with gr.Row():
                 hps_eo = gr.Textbox('./datasets/Optical/trainB', label='EO(광학) 참조 폴더 (FID 기준)')
                 hps_incw = gr.Textbox('', label='InceptionV3 가중치 .pth (오프라인용, 비우면 자동)')
+                hps_stall = gr.Number(20, label='trial별 행(hang) 감지 시간 (분)', precision=0)
             hps_btn = gr.Button('🚀 자동 탐색 실행', variant='primary')
             hps_log = gr.Textbox(label='탐색 진행/결과 로그', lines=18, interactive=False, max_lines=18)
             with gr.Row():
@@ -2281,7 +2243,7 @@ def build_ui():
                         inputs=[cfg_path, stall_minutes, max_restarts] + ordered_inputs,
                         outputs=monitor_outputs)
         inf_btn.click(run_inference,
-                      inputs=[inf_num, inf_epoch] + ordered_inputs,
+                      inputs=[inf_num, inf_epoch, inf_stall] + ordered_inputs,
                       outputs=[inf_status, inf_gallery])
         eval_btn.click(cut_evaluate,
                       inputs=[eval_epoch, eval_exp, eval_notes, comp['eval_eo_dir'],
@@ -2299,7 +2261,7 @@ def build_ui():
         hps_btn.click(cut_hparam_search,
                       inputs=[hps_out, hps_n, hps_s1ep, hps_s2ep, hps_topk,
                               hps_s1img, hps_s2img, hps_ntest, hps_primary,
-                              hps_eo, hps_incw] + ordered_inputs,
+                              hps_eo, hps_incw, hps_stall] + ordered_inputs,
                       outputs=hps_log)
 
     return demo

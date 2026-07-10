@@ -29,14 +29,16 @@ and always constructs commands exactly the way the GUI does.
 """
 
 import os
+import re
 import csv
 import json
 import hashlib
 import datetime
 import traceback
-import subprocess
 
 import numpy as np
+
+from util.subprocess_watchdog import run_watched_stream, MIN_STALL_SECONDS
 
 from preprocessing.pipeline import scan_images
 from preprocessing import fid_utils as _fu
@@ -170,30 +172,40 @@ def _load_done(path):
     return done
 
 
-def _stream_subprocess(cmd, cwd, log, tag, holder):
-    """Run cmd, yielding a log line per completed epoch; final rc in holder."""
-    proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, bufsize=1,
-                            env=dict(os.environ, PYTHONUNBUFFERED='1'))
-    tail = []
-    for raw in iter(proc.stdout.readline, ''):
-        line = raw.rstrip()
-        if not line:
-            continue
-        tail.append(line)
-        del tail[:-30]
+# matches either a print_freq iteration line or the once-per-epoch summary --
+# used only to decide "is this real forward progress" for the stall watchdog;
+# the log/yield below still only surfaces "End of epoch" lines, same as before.
+_PROGRESS_RE = re.compile(r'epoch:\s*\d+,\s*iters:\s*\d+|End of epoch')
+
+
+def _stream_subprocess(cmd, cwd, log, tag, holder, stall_minutes=20, is_stopped=None):
+    """Run cmd under the shared stall watchdog (util/subprocess_watchdog.py),
+    yielding a log line per completed epoch; final result dict in `holder`
+    ({'rc', 'stalled', 'stopped', 'tail'}).
+
+    This is what fixes hangs during hyperparameter search: previously this
+    used a plain blocking readline loop with NO timeout, so a single hung
+    trial (stuck DataLoader, GPU/driver hang, ...) would block the ENTIRE
+    multi-hour search forever. Now a stalled trial is killed after
+    `stall_minutes` and reported with holder['rc']=None -- run_stage()
+    already treats any non-zero/None rc as a failed trial and moves on to the
+    next one, so no caller-side change was needed beyond passing this through.
+    """
+    for line in run_watched_stream(cmd, cwd, holder, stall_minutes=stall_minutes,
+                                   progress_re=_PROGRESS_RE, is_stopped=is_stopped,
+                                   min_stall_seconds=MIN_STALL_SECONDS):
         if 'End of epoch' in line:
             yield log(f'{tag} {line.strip()}')
-    proc.wait()
-    holder['rc'] = proc.returncode
-    holder['tail'] = tail
+    if holder.get('stalled'):
+        yield log(f'{tag} ⚠️ {stall_minutes}분 동안 진행 없음(행/hang) 감지 → 프로세스를 강제 종료했습니다. '
+                  f'이 trial은 실패로 기록하고 다음으로 넘어갑니다.')
 
 
 def hparam_search(base_cfg, build_train_cmd, build_test_cmd, out_dir,
                   space=None, n_trials=12, stage1_epochs=15, stage2_epochs=45,
                   top_k=5, stage1_images=300, stage2_images=0, num_test=100,
                   primary='fid', eo_dir=None, inception_weights=None,
-                  fid_max=300, repo_root=None, seed=42):
+                  fid_max=300, repo_root=None, seed=42, stall_minutes=20):
     """Generator yielding log strings. Writes hparam_results.csv (resumable)
     and best_hparams.json under out_dir.
 
@@ -201,6 +213,12 @@ def hparam_search(base_cfg, build_train_cmd, build_test_cmd, out_dir,
     results_dir, netG, crop_size, ...); each trial overrides only the searched
     keys plus name/epoch bookkeeping. build_train_cmd(cfg) / build_test_cmd(cfg,
     num_test, epoch) construct the actual CLI commands (inject gui.py's).
+
+    stall_minutes: each trial's train.py/test.py subprocess is killed and the
+    trial marked 'failed' (search continues to the next trial) if it produces
+    no progress for this long -- otherwise a single hung trial (stuck
+    DataLoader, GPU/driver hang, ...) would block the ENTIRE multi-hour search
+    forever, exactly like the un-watchdogged main training tab used to.
     """
     os.makedirs(out_dir, exist_ok=True)
     results_csv = os.path.join(out_dir, 'hparam_results.csv')
@@ -324,7 +342,7 @@ def hparam_search(base_cfg, build_train_cmd, build_test_cmd, out_dir,
                    continue_train=bool(continue_train))
         holder = {}
         yield from _stream_subprocess(build_train_cmd(cfg), repo_root, log,
-                                      f'[{name} s{stage}]', holder)
+                                      f'[{name} s{stage}]', holder, stall_minutes=stall_minutes)
         if holder.get('rc', 1) != 0:
             record(sig, stage, 'failed', name, ov, epochs_total, None)
             yield log(f'[{name} s{stage}] 학습 실패 → 기록 후 건너뜀\n'
@@ -332,7 +350,8 @@ def hparam_search(base_cfg, build_train_cmd, build_test_cmd, out_dir,
             return
         holder2 = {}
         yield from _stream_subprocess(build_test_cmd(cfg, int(num_test), 'latest'),
-                                      repo_root, log, f'[{name} s{stage} test]', holder2)
+                                      repo_root, log, f'[{name} s{stage} test]', holder2,
+                                      stall_minutes=stall_minutes)
         m = score_trial(name) if holder2.get('rc', 1) == 0 else None
         if m is None:
             record(sig, stage, 'failed', name, ov, epochs_total, None)

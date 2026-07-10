@@ -65,9 +65,19 @@ space = dict(DEFAULT_SPACE, lambda_grad=[0.0, 0.5, 1.0, 2.0])
 - 더 빠르게: stage1 장수/epoch을 줄이거나 trial 수를 줄이세요. 단 stage1이 너무 짧으면(< ~10 epoch) 랭킹 신뢰도가 떨어집니다.
 - 탐색 공간이 커진 만큼(3단계 lambda × on/off 토글들), 커버리지를 높이고 싶으면 `n_trials`(후보 trial 수)를 12보다 늘리는 것도 고려하세요.
 
+## 행(hang) 방지
+
+각 trial의 train.py/test.py 실행은 탭 6(학습)과 **동일한 stall watchdog**(`util/subprocess_watchdog.py`)
+으로 보호됩니다 — **탐색 결과/로그 폴더** 옆의 "**trial별 행(hang) 감지 시간**"(기본 20분) 동안 진행이
+없으면 그 trial을 강제 종료하고 **실패로 기록한 뒤 다음 trial로 계속 진행**합니다. 예전에는 이 보호가
+전혀 없어서 trial 하나가 멈추면(DataLoader 정지, GPU 행 등) **탐색 전체가 영원히 멈췄습니다** — 특히
+밤새/수십 시간 돌리는 이 기능의 특성상 치명적이었던 문제입니다.
+
 ## 주의
 
 - **GPU 직렬 실행**입니다(한 번에 한 trial). trial 체크포인트가 `checkpoints_dir/hps_*` 로 여러 개 쌓이므로, 탐색용 `checkpoints_dir`를 따로 두는 걸 권장합니다.
 - stage1 랭킹은 "짧은 학습" 기준의 근사입니다 — 초반 FID 순위와 최종 순위가 항상 일치하진 않습니다. 그래서 상위 K개를 stage2로 더 길게 확인하는 것이고, K를 늘리면 안전해지는 대신 느려집니다.
 - Optuna 같은 베이지안 라이브러리도 대안이지만, 오프라인 사내망 + 수십 개 수준의 후보에서는 이 의존성 없는 랜덤+halving 구현이 실용적으로 충분합니다.
-- 검증: `python tests/test_hparam_search.py` — 동등 설정 dedup, 결정적 샘플링, 실제 train/test를 통한 소형 엔드투엔드, 재개 시 재학습 0회를 확인합니다.
+- 검증: `python tests/test_hparam_search.py` — 동등 설정 dedup, 결정적 샘플링, 실제 train/test를 통한 소형
+  엔드투엔드, 재개 시 재학습 0회, **그리고 한 trial을 실제로 hang시켜서 탐색 전체가 멈추지 않고 계속
+  진행되는지**까지 확인합니다.
