@@ -413,3 +413,326 @@ def optimize_orders(sar_dir, out_dir, n_stage1=200, n_stage2=1000, top_k=10,
               f'enl={fmt(best_m.get("enl"),".2f")}  SI={fmt(best_m.get("speckle_index"),".3f")}  '
               f'fid={fmt(best_m.get("fid"),".2f")}\n'
               f'결과 로그: {results_csv}\n저장: {os.path.join(out_dir, "best_pipeline.json")}')
+
+
+# =========================================================================== #
+# STAGE 2: per-step PARAMETER optimization (coordinate descent)
+#
+# Runs AFTER the order search: takes a fixed order + speckle method (normally
+# read from stage-1's best_pipeline.json) and tunes each order-sensitive step's
+# numeric parameters one step at a time. Coordinate descent = for each step,
+# grid-sweep its params while holding every other step fixed at the current
+# best, keep the winner, move to the next step. Candidate count grows as the
+# SUM of per-step grids (cheap), not their product.
+#
+# Reuses the stage-1 infra wholesale: build_steps / the same in-memory
+# evaluate loop / the same PSNR/CC/EPI/ENL/SI(+optional FID) metrics / the same
+# resumable append-only CSV. Structural steps (resize/channel/normalize/
+# validate) are auto-excluded because their PARAM_SPACE is empty.
+# =========================================================================== #
+
+from preprocessing.steps import STEP_REGISTRY
+
+
+def _set_dotted(d, dotted_key, value):
+    """Set d['a']['b'] = value for dotted_key 'a.b' (creates nested dicts)."""
+    keys = dotted_key.split('.')
+    cur = d
+    for k in keys[:-1]:
+        cur = cur.setdefault(k, {})
+        if not isinstance(cur, dict):        # existing scalar where we need a dict
+            cur = {}
+    cur[keys[-1]] = value
+
+
+def tunable_steps_in_order(order):
+    """The order-sensitive steps (in pipeline order) that expose a non-empty
+    PARAM_SPACE -- i.e. the ones the parameter optimizer will tune. Structural
+    steps never appear here (empty PARAM_SPACE)."""
+    out = []
+    for name in order:
+        space = dict(getattr(STEP_REGISTRY.get(name), 'PARAM_SPACE', {}) or {})
+        if space:
+            out.append((name, space))
+    return out
+
+
+def _relevant_param_space(step_name, space, speckle_method):
+    """Prune candidate values that don't apply to the current fixed config, so
+    the sweep doesn't waste evaluations on no-op combinations."""
+    space = {k: list(v) for k, v in space.items()}
+    if step_name == 'speckle_filter':
+        # damping_factor only affects frost; for other methods it's a dead knob
+        if speckle_method != 'frost':
+            space.pop('damping_factor', None)
+    if step_name == 'histogram_mapping':
+        # clahe needs cv2; if it's unavailable, 'enabled=True' is a silent no-op
+        # (the step logs a warning and returns unchanged) -> don't sweep it
+        try:
+            import cv2  # noqa
+        except Exception:
+            space.pop('clahe.enabled', None)
+            space.pop('clahe.clip_limit', None)
+    return space
+
+
+def build_param_pipeline_steps(order, speckle_method, param_overrides,
+                               image_size=256, hist_mode='sar_only',
+                               optical_reference_dir=None, reference_cdf_path=None):
+    """Same as build_pipeline_steps but applies param_overrides =
+    {step_name: {dotted_param: value}} on top of the default step configs."""
+    steps = build_pipeline_steps(order, speckle_method, image_size, hist_mode,
+                                 optical_reference_dir, reference_cdf_path)
+    for cfg in steps:
+        ov = (param_overrides or {}).get(cfg['name'])
+        if ov:
+            for dotted, val in ov.items():
+                _set_dotted(cfg['params'], dotted, val)
+    return steps
+
+
+def evaluate_param_pipeline(order, speckle_method, param_overrides, files,
+                            image_size=256, hist_mode='sar_only', optical_target=None):
+    """Like evaluate_pipeline but with per-step parameter overrides applied.
+    Returns the same metrics dict (psnr/cc/epi/enl/speckle_index/composite/count)."""
+    steps_cfg = build_param_pipeline_steps(order, speckle_method, param_overrides,
+                                           image_size, hist_mode)
+    steps = build_steps(steps_cfg)
+    ps, cs, es, es_si, es_enl = [], [], [], [], []
+    n = 0
+    for path in files:
+        try:
+            raw = _load_gray(path)
+            ctx = {'input_path': path, 'optical_target': optical_target,
+                   'stats': {}, 'skip': False}
+            img = raw
+            for s in steps:
+                if not s.enabled:
+                    continue
+                img, ctx = s.apply(img, ctx)
+                if ctx.get('skip'):
+                    break
+            if ctx.get('skip'):
+                continue
+            a = np.asarray(img).astype(np.float64)
+            if a.ndim == 3:
+                a = a.mean(-1)
+            proc = np.clip(a / 255.0 if a.max() > 1 else a, 0, 1)
+            ref = _resize_to(_safe_gray01(raw), proc.shape)
+            ps.append(psnr(ref, proc))
+            cs.append(cc(ref, proc))
+            es.append(epi(ref, proc))
+            mu, sd = float(proc.mean()), float(proc.std())
+            es_si.append(sd / (mu + EPS))
+            es_enl.append((mu * mu) / (sd * sd + EPS))
+            n += 1
+        except Exception:
+            continue
+    if n == 0:
+        return None
+    m = {'psnr': float(np.mean(ps)), 'cc': float(np.mean(cs)),
+         'epi': float(np.mean(es)), 'speckle_index': float(np.mean(es_si)),
+         'enl': float(np.mean(es_enl)), 'count': n}
+    m['composite'] = composite_score(m)
+    return m
+
+
+def _param_signature(order, speckle_method, param_overrides, n_images):
+    payload = json.dumps(param_overrides, sort_keys=True, default=str)
+    return f"params|{'>'.join(order)}|speckle={speckle_method}|{payload}|n={n_images}"
+
+
+def load_best_pipeline(path):
+    """Read a stage-1 best_pipeline.json -> (order, speckle) or (None, None)."""
+    try:
+        with open(path, encoding='utf-8') as f:
+            best = json.load(f)
+        order = list(best.get('order') or [])
+        speckle = best.get('speckle')
+        if order and speckle:
+            return order, speckle
+    except Exception:
+        pass
+    return None, None
+
+
+def optimize_params(sar_dir, out_dir, order=None, speckle_method=None,
+                    best_pipeline_path=None, n_images=300, primary='composite',
+                    hist_mode='sar_only', optical_dir=None, max_scan=0,
+                    passes=1):
+    """Generator yielding log strings. Coordinate-descent parameter search over
+    the tunable steps of a FIXED order. Writes param_search_results.csv
+    (resumable) and best_params_pipeline.json under out_dir.
+
+    order/speckle_method: if omitted, read from best_pipeline_path (defaults to
+    <out_dir>/best_pipeline.json produced by the order search) -- this is the
+    "automatic hand-off" from stage 1 to stage 2.
+    passes: how many full coordinate-descent sweeps over all steps (a 2nd pass
+    can improve results when steps interact, at ~2x cost).
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    results_csv = os.path.join(out_dir, 'param_search_results.csv')
+    log_path = os.path.join(out_dir, 'param_search.log')
+    logs = []
+
+    def log(msg):
+        line = f'[{datetime.datetime.now().strftime("%H:%M:%S")}] {msg}'
+        logs.append(line)
+        try:
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(line + '\n')
+        except Exception:
+            pass
+        return '\n'.join(logs[-300:])
+
+    # --- resolve the fixed order/speckle (from args or best_pipeline.json) ---
+    if not order or not speckle_method:
+        bp = best_pipeline_path or os.path.join(out_dir, 'best_pipeline.json')
+        o2, s2 = load_best_pipeline(bp)
+        order = order or o2
+        speckle_method = speckle_method or s2
+        if order and speckle_method:
+            yield log(f'순서 자동 연결: {bp} 에서 order/speckle 로드')
+    if not order or not speckle_method:
+        yield log('오류: 고정할 순서(order)와 speckle 방법이 필요합니다. '
+                  '먼저 "순서 자동 최적화"를 실행하거나 순서를 직접 지정하세요.')
+        return
+    yield log(f'고정 순서: validate -> {" -> ".join(order)} -> resize -> channel -> normalize  '
+              f'· speckle={speckle_method}')
+
+    files = scan_images(sar_dir, recursive=True, shuffle=False, seed=42,
+                        max_items=int(max_scan or 0))
+    if not files:
+        yield log(f'오류: SAR 입력 폴더에 이미지가 없습니다: {sar_dir}')
+        return
+    files = files[:int(n_images)]
+    yield log(f'SAR {len(files)}장으로 파라미터 탐색 (랭킹 기준={primary})')
+
+    optical_target = None
+    if hist_mode in ('unpaired_optical_reference', 'preset'):
+        try:
+            optical_target = (load_reference_cdf(optical_dir) if hist_mode == 'preset'
+                              else build_optical_reference_cdf(optical_dir, 1024))
+        except Exception:
+            optical_target = None
+
+    tunables = tunable_steps_in_order(order)
+    if not tunables:
+        yield log('이 순서에는 조절 가능한 파라미터를 가진 스텝이 없습니다.')
+        return
+    yield log('조절 대상 스텝: ' + ', '.join(f'{n}({",".join(_relevant_param_space(n, sp, speckle_method))})'
+                                            for n, sp in tunables))
+
+    # --- resumable CSV ---
+    done = _load_done(results_csv)
+    new_file = not os.path.exists(results_csv)
+    mf = open(results_csv, 'a', newline='', encoding='utf-8')
+    writer = csv.writer(mf)
+    cols = ('psnr', 'cc', 'epi', 'enl', 'speckle_index', 'composite')
+    if new_file:
+        writer.writerow(['signature', 'step', 'param', 'value', 'overrides', 'n_images']
+                        + list(cols) + ['timestamp'])
+        mf.flush()
+
+    def _f(x):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return None
+
+    def metric_of(m):
+        if m is None:
+            return None
+        return m.get(primary)
+
+    direction = METRIC_DIRECTION.get(primary, 1)
+
+    def better(a, b):
+        """Is metric a strictly better than b (None = worst)?"""
+        if a is None:
+            return False
+        if b is None:
+            return True
+        return (a > b) if direction > 0 else (a < b)
+
+    def _round4(m):
+        # Round to the SAME precision the CSV stores, and use these rounded
+        # values everywhere (fresh run AND resumed run). Otherwise a fresh run
+        # decides the coordinate-descent path on full-precision metrics while a
+        # resumed run reads back 4-decimal values from the CSV -> the strict
+        # better() comparison can diverge -> a different descent path -> new
+        # (uncached) trials get evaluated -> resume isn't a no-op. Rounding
+        # consistently makes the descent path deterministic across runs.
+        return {c: (None if (m or {}).get(c) is None else round(float(m[c]), 4)) for c in cols}
+
+    def evaluate(overrides):
+        """Evaluate an override set, using the resumable cache when possible."""
+        sig = _param_signature(order, speckle_method, overrides, len(files))
+        if sig in done:
+            row = done[sig]
+            return {c: _f(row.get(c)) for c in cols}
+        m = evaluate_param_pipeline(order, speckle_method, overrides, files,
+                                    hist_mode=hist_mode, optical_target=optical_target)
+        d = _round4(m)
+        row = [sig, '', '', '', json.dumps(overrides, sort_keys=True, default=str), len(files)]
+        row += [('' if d.get(c) is None else d[c]) for c in cols]
+        row += [datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')]
+        writer.writerow(row)
+        mf.flush()
+        done[sig] = dict(d)
+        return d
+
+    # --- baseline: default params for the fixed order ---
+    current = {}                       # step_name -> {dotted_param: value}
+    base_m = evaluate(current)
+    best_metric = metric_of(base_m)
+    yield log(f'기준(기본 파라미터) {primary}={best_metric}')
+
+    total_evals = 1
+    for pass_i in range(int(max(1, passes))):
+        yield log(f'=== 좌표하강 pass {pass_i+1}/{int(max(1,passes))} ===')
+        improved_this_pass = False
+        for step_name, full_space in tunables:
+            space = _relevant_param_space(step_name, full_space, speckle_method)
+            for param, values in space.items():
+                best_val, best_here = None, best_metric
+                cur_val = current.get(step_name, {}).get(param, '(default)')
+                for val in values:
+                    trial = {k: dict(v) for k, v in current.items()}
+                    trial.setdefault(step_name, {})[param] = val
+                    m = evaluate(trial)
+                    total_evals += 1
+                    mv = metric_of(m)
+                    if better(mv, best_here):
+                        best_here, best_val = mv, val
+                if best_val is not None and better(best_here, best_metric):
+                    current.setdefault(step_name, {})[param] = best_val
+                    yield log(f'  {step_name}.{param}: {cur_val} -> {best_val}  '
+                              f'({primary} {best_metric} -> {best_here})')
+                    best_metric = best_here
+                    improved_this_pass = True
+                else:
+                    yield log(f'  {step_name}.{param}: 개선 없음 (유지)')
+        if not improved_this_pass:
+            yield log('이번 pass에서 개선이 없어 조기 종료합니다.')
+            break
+
+    # --- save the tuned pipeline ---
+    full_steps = build_param_pipeline_steps(order, speckle_method, current, hist_mode=hist_mode)
+    best = {'order': list(order), 'speckle': speckle_method,
+            'param_overrides': current, 'primary': primary,
+            'metric': best_metric, 'n_images': len(files), 'total_evals': total_evals,
+            'full_steps': full_steps}
+    try:
+        with open(os.path.join(out_dir, 'best_params_pipeline.json'), 'w', encoding='utf-8') as f:
+            json.dump(best, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+    mf.close()
+
+    ov_txt = json.dumps(current, ensure_ascii=False) if current else '(기본값이 최적)'
+    yield log('=== 최적 파라미터 ===\n'
+              f'{ov_txt}\n'
+              f'{primary}={best_metric}  · 평가 횟수={total_evals}\n'
+              f'결과 로그: {results_csv}\n'
+              f'저장: {os.path.join(out_dir, "best_params_pipeline.json")}')

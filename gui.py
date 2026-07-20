@@ -64,7 +64,7 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 # up to date (printed on launch and shown in the UI header). If the version you
 # see in the browser/console does not match the latest, you are running an old
 # copy and must replace gui.py / preprocessing/.
-BUILD = '2026-07-08.4 (system-wide-subprocess-watchdog)'
+BUILD = '2026-07-08.5 (preprocessing-param-optimizer)'
 
 
 # --------------------------------------------------------------------------- #
@@ -1575,6 +1575,28 @@ def pp_optimize(sar_dir, out_dir, n1, n2, topk, primary, hist_mode, optical,
         yield '순서 최적화 중 예외:\n' + traceback.format_exc()
 
 
+def pp_optimize_params(sar_dir, out_dir, n_images, primary, hist_mode, optical,
+                       passes, order_override, speckle_override):
+    """Stage 2: coordinate-descent parameter optimization on a FIXED order.
+    By default the order/speckle is auto-loaded from the order search's
+    best_pipeline.json in the same out_dir (the '자동 연결'); optional text
+    overrides let the user run it standalone without a prior order search."""
+    import preprocessing as PP
+    out_dir = out_dir or './datasets/_order_search'
+    order = [s.strip() for s in str(order_override or '').replace('>', ',').split(',') if s.strip()] or None
+    try:
+        for line in PP.optimize_params(
+                sar_dir, out_dir,
+                order=order, speckle_method=(str(speckle_override).strip() or None) if speckle_override else None,
+                best_pipeline_path=os.path.join(out_dir, 'best_pipeline.json'),
+                n_images=int(n_images or 300), primary=primary,
+                hist_mode=hist_mode, optical_dir=(optical or None),
+                passes=int(passes or 1)):
+            yield line
+    except Exception:
+        yield '파라미터 최적화 중 예외:\n' + traceback.format_exc()
+
+
 def pp_metrics(output_dir, max_items):
     """SAR preprocessing quality metrics averaged over <output_dir>/images.
 
@@ -1888,6 +1910,41 @@ def build_ui():
                                       opt_primary, opt_hist, opt_optical,
                                       opt_eo, opt_use_fid, opt_fid_max, opt_incw],
                               outputs=opt_log)
+
+            with gr.Accordion('⑨ 전처리 파라미터 자동 최적화 (순서 확정 후 · 좌표하강 · 재개 가능)', open=False):
+                gr.Markdown(
+                    '⑧에서 **순서를 확정한 뒤**, 각 전처리 스텝의 세부 파라미터(클리핑 세기, speckle 윈도우 크기, '
+                    'intensity 모드 등)를 **좌표하강**으로 자동 탐색합니다.\n'
+                    '- **순서 자동 연결**: 결과 폴더의 `best_pipeline.json`(⑧ 결과)에서 순서·speckle을 자동으로 읽어옵니다. '
+                    '아래 "순서 직접 지정"을 비워두면 됩니다.\n'
+                    '- **조절 대상**: `sar_intensity_transform`(mode), `speckle_filter`(window_size, frost는 damping도), '
+                    '`outlier_clipping`(min/max_percentile), `histogram_mapping`(clahe). '
+                    '**resize·channel·normalize·validate는 자동 제외**됩니다(조절 파라미터 없음).\n'
+                    '- 좌표하강 = 한 번에 한 파라미터만 그리드로 훑어 최적값 확정 → 다음 파라미터. 후보 수가 곱이 아니라 '
+                    '합으로 늘어 저렴합니다. **중단해도 재개 가능**.\n'
+                    '- 결과: `<결과폴더>/param_search_results.csv`, `best_params_pipeline.json`(순서+최적 파라미터).')
+                with gr.Row():
+                    pop_sar = gr.Textbox('./datasets/M4-SAR/raw_sar', label='SAR 입력 폴더')
+                    pop_out = gr.Textbox('./datasets/_order_search', label='결과/로그 폴더 (⑧과 동일하게 두면 자동 연결)')
+                with gr.Row():
+                    pop_n = gr.Number(300, label='평가 장수', precision=0)
+                    pop_primary = gr.Dropdown(['composite', 'epi', 'enl', 'speckle_index', 'psnr', 'cc'],
+                                              value='composite', label='랭킹 기준 지표')
+                    pop_passes = gr.Number(1, label='좌표하강 pass 수 (2면 상호작용 반영↑, 비용↑)', precision=0)
+                with gr.Row():
+                    pop_hist = gr.Dropdown(PP.HISTOGRAM_MODES, value='sar_only', label='histogram 모드 (⑧과 동일하게)')
+                    pop_optical = gr.Textbox('', label='histogram용 Optical 폴더/.npy (unpaired/preset 시)')
+                gr.Markdown('**순서 직접 지정 (선택)** — ⑧을 안 돌리고 바로 파라미터만 튜닝하고 싶을 때만 입력하세요. '
+                            '비우면 위 결과 폴더의 `best_pipeline.json`에서 자동으로 가져옵니다.')
+                with gr.Row():
+                    pop_order = gr.Textbox('', label='순서 (쉼표/> 구분, 예: sar_intensity_transform>speckle_filter>outlier_clipping>histogram_mapping)')
+                    pop_speckle = gr.Textbox('', label='speckle 방법 (예: refined_lee)')
+                pop_btn = gr.Button('🚀 파라미터 자동 최적화 실행', variant='primary')
+                pop_log = gr.Textbox(label='파라미터 최적화 진행/결과 로그', lines=18, interactive=False, max_lines=18)
+                pop_btn.click(pp_optimize_params,
+                              inputs=[pop_sar, pop_out, pop_n, pop_primary, pop_hist, pop_optical,
+                                      pop_passes, pop_order, pop_speckle],
+                              outputs=pop_log)
 
         # ---- Tab 3 : Basic training params ----------------------------- #
         with gr.Tab('3. 기본 학습 파라미터'):

@@ -80,6 +80,14 @@ def optical_like_v1_cdf(num_bins=1024):
 class PreprocessStep:
     name = 'base'
 
+    # Tunable-parameter search space for the automatic parameter optimizer
+    # (preprocessing/optimize.py::optimize_params). Maps a param key -> list of
+    # candidate values. Nested keys use dotted paths (e.g. 'clahe.clip_limit').
+    # A step with an EMPTY spec is automatically excluded from parameter search
+    # -- this is how structural/format steps (resize_or_tile, channel_adapter,
+    # normalize_for_cut, validate_image) opt out without any special-casing.
+    PARAM_SPACE = {}
+
     def __init__(self, enabled=True, **params):
         self.enabled = enabled
         self.params = params
@@ -112,6 +120,7 @@ class ValidateImageStep(PreprocessStep):
 
 class SARIntensityTransformStep(PreprocessStep):
     name = 'sar_intensity_transform'
+    PARAM_SPACE = {'mode': ['none', 'log1p', 'db']}
 
     def apply(self, image, context):
         img = _to_gray01(image)
@@ -129,6 +138,14 @@ class SARIntensityTransformStep(PreprocessStep):
 
 class SpeckleFilterStep(PreprocessStep):
     name = 'speckle_filter'
+    # 'method' is already searched by the ORDER optimizer (per-candidate); the
+    # parameter optimizer refines the numeric knobs. window_size applies to all
+    # window-based methods; damping_factor only matters for frost (a no-op key
+    # for others, harmless to sweep but the optimizer can skip it when method!=frost).
+    PARAM_SPACE = {
+        'window_size': [5, 7, 9, 11],
+        'damping_factor': [1.0, 2.0, 3.0],
+    }
 
     def apply(self, image, context):
         x = _to_gray01(image)
@@ -223,6 +240,10 @@ class SpeckleFilterStep(PreprocessStep):
 
 class OutlierClippingStep(PreprocessStep):
     name = 'outlier_clipping'
+    PARAM_SPACE = {
+        'min_percentile': [0.0, 0.2, 0.5, 1.0, 2.0],
+        'max_percentile': [98.0, 99.0, 99.5, 99.8, 99.95],
+    }
 
     def apply(self, image, context):
         x = _to_gray01(image)
@@ -240,6 +261,14 @@ class OutlierClippingStep(PreprocessStep):
 
 class HistogramMappingStep(PreprocessStep):
     name = 'histogram_mapping'
+    # 'mode' is left OUT of the sweep on purpose: it changes what reference the
+    # mapping needs (preset/unpaired need an optical target folder/npy), which
+    # is a data-availability choice the user makes, not a numeric knob. The
+    # clahe knobs are pure post-hoc contrast tuning and safe to sweep.
+    PARAM_SPACE = {
+        'clahe.enabled': [False, True],
+        'clahe.clip_limit': [1.0, 2.0, 4.0],
+    }
 
     def apply(self, image, context):
         x = _to_gray01(image)

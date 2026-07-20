@@ -36,6 +36,7 @@ try:
         optimize_orders, enumerate_candidates, build_pipeline_steps,
         evaluate_pipeline, PERMUTE_STEPS,
         resolve_inception_weights, INCEPTION_FILENAME,
+        optimize_params, tunable_steps_in_order, load_best_pipeline,
     )
     __all__ += [
         'save_reference_cdf', 'load_reference_cdf',
@@ -44,6 +45,7 @@ try:
         'optimize_orders', 'enumerate_candidates', 'build_pipeline_steps',
         'evaluate_pipeline', 'PERMUTE_STEPS',
         'resolve_inception_weights', 'INCEPTION_FILENAME',
+        'optimize_params', 'tunable_steps_in_order', 'load_best_pipeline',
     ]
     FEATURES_OK = True
 except Exception as _exc:  # stale / partially-updated files
