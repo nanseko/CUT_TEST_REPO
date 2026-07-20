@@ -50,3 +50,14 @@ try:
                 'load_best', 'DEFAULT_SPACE']
 except Exception:
     pass
+
+# Target (building/vehicle/aircraft) visual-identifiability enhancement --
+# CFAR + saliency detection (stage A) and saliency-guided local enhancement
+# (stage B) of docs/TARGET_ENHANCEMENT_SPEC.md. Pure NumPy/Pillow; only the
+# 'clahe' method and the fast connected-components path need opencv (degrade/
+# raise clearly at call time, see evaluation/target_enhance.py).
+try:
+    from evaluation.target_enhance import detect_targets, enhance_targets, enhance_folder
+    __all__ += ['detect_targets', 'enhance_targets', 'enhance_folder']
+except Exception:
+    pass

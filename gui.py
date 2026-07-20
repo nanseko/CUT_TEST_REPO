@@ -64,7 +64,7 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 # up to date (printed on launch and shown in the UI header). If the version you
 # see in the browser/console does not match the latest, you are running an old
 # copy and must replace gui.py / preprocessing/.
-BUILD = '2026-07-08.5 (preprocessing-param-optimizer)'
+BUILD = '2026-07-08.6 (target-enhancement-cfar-saliency)'
 
 
 # --------------------------------------------------------------------------- #
@@ -114,7 +114,7 @@ CONFIG_KEYS = [
     # 8/9. Per-tab data-folder overrides (persisted like everything else above;
     # empty string = auto-derive from results_dir/name/test_<epoch> as before)
     'eval_eo_dir', 'eval_real_b_dir', 'eval_fake_dir', 'eval_real_a_dir',
-    'rectify_input_dir',
+    'rectify_input_dir', 'enhance_input_dir',
 ]
 
 DEFAULTS = {
@@ -171,6 +171,7 @@ DEFAULTS = {
     'eval_fake_dir': '',
     'eval_real_a_dir': '',
     'rectify_input_dir': '',
+    'enhance_input_dir': '',
 }
 
 IMAGE_EXTS = ('*.png', '*.jpg', '*.jpeg', '*.bmp', '*.tif', '*.tiff')
@@ -913,6 +914,54 @@ def cut_rectify(epoch, min_area, max_area_frac, min_rectangularity, input_dir_ov
         return f'오류: {exc}', []
     except Exception:
         return '후처리 중 예외:\n' + traceback.format_exc(), []
+
+
+def cut_enhance_targets(epoch, methods, cfar_method, guard, train, k_sigma,
+                        saliency_window, saliency_floor, min_area, max_area_frac,
+                        unsharp_amount, unsharp_radius, guided_boost, guided_radius,
+                        clahe_clip, input_dir_override, *cfg_values):
+    """표적(건물/차량/비행체) 시각적 강조 — docs/TARGET_ENHANCEMENT_SPEC.md의 stage A
+    (CFAR+saliency 검출) + stage B (saliency 가중 국소 강조). fake_B 전역에 선명화/
+    대비 강화를 걸면 SAR 스페클이 배경에서도 함께 증폭되므로, 검출된 표적다움
+    (saliency) 가중치로만 블렌딩합니다 — 탭 9 형상 후처리(cut_rectify)와 동일하게
+    입력 폴더 직접 지정 + epoch 기본값(fake_B) 패턴을 따릅니다."""
+    cfg = _cfg_from_values(cfg_values)
+    input_dir = (str(input_dir_override).strip() if input_dir_override else '') or \
+        os.path.join(str(cfg['results_dir']), str(cfg['name']), f'test_{epoch}', 'images', 'fake_B')
+    if not os.path.isdir(input_dir):
+        return (f'오류: 폴더가 없습니다: {input_dir}\n'
+                f'(기본값은 "7. 추론/테스트" 결과의 fake_B 폴더입니다 — 먼저 추론을 실행하거나, '
+                f'위 "입력 폴더 직접 지정"에 분석할 폴더를 지정하세요.)', [])
+    out_dir = os.path.join(str(cfg['results_dir']), str(cfg['name']), f'test_{epoch}', 'enhanced')
+    methods = tuple(methods or [])
+    if not methods:
+        return '오류: 최소 하나 이상의 강조 방법을 선택하세요 (unsharp/guided/clahe).', []
+    try:
+        import evaluation as EV
+        csv_path, n_regions, n_ok, n_fail, failures = EV.enhance_folder(
+            input_dir, out_dir, methods=methods,
+            detect_kwargs=dict(
+                guard=int(guard or 2), train=int(train or 9), method=str(cfar_method or 'sigma'),
+                k_sigma=float(k_sigma or 3.0), saliency_window=int(saliency_window or 5),
+                saliency_floor=float(saliency_floor or 0.15), min_area=float(min_area or 9),
+                max_area_frac=float(max_area_frac or 0.2)),
+            unsharp_kwargs=dict(amount=float(unsharp_amount or 0.6), radius=int(unsharp_radius or 3)),
+            guided_kwargs=dict(boost=float(guided_boost or 1.5), radius=int(guided_radius or 5)),
+            clahe_kwargs=dict(clip_limit=float(clahe_clip or 2.0)))
+        gallery = list_images(out_dir)
+        if n_ok == 0 and n_fail > 0:
+            detail = '\n'.join(f'  - {name}: {err}' for name, err in failures)
+            return (f'❌ 처리 실패: {input_dir} 의 이미지 {n_fail}개 전부 실패했습니다.\n{detail}', [])
+        msg = (f'✅ 완료: {input_dir} · {n_ok}장 처리, 표적 후보 {n_regions}개 검출 → {out_dir}\n'
+               f'표적 영역 목록: {csv_path}')
+        if n_fail:
+            detail = '\n'.join(f'  - {name}: {err}' for name, err in failures)
+            msg += f'\n⚠️ {n_fail}장 실패:\n{detail}'
+        return (msg, gallery[:24])
+    except ImportError as exc:
+        return f'오류: {exc}', []
+    except Exception:
+        return '표적 강조 중 예외:\n' + traceback.format_exc(), []
 
 
 HPS_APPLY_KEYS = ['attention_type', 'attention_reduction', 'attention_encoder',
@@ -2234,6 +2283,46 @@ def build_ui():
             rect_gallery = gr.Gallery(label='검출된 사각형 오버레이 (초록=사각형, 빨강=단순화 다각형)',
                                       columns=4, height='auto')
 
+            gr.Markdown('---')
+            gr.Markdown(
+                '### 표적(건물·차량·비행체) 시각적 강조\n'
+                '`fake_B`에서 **CFAR**(SAR 표준 적응형 국소 임계값) + saliency로 표적 후보를 검출하고, '
+                '검출된 영역에만 선명화/대비 강화를 블렌딩합니다. **전역으로 걸지 않는 이유**: SAR 유래 '
+                '스페클을 배경까지 함께 증폭시키기 때문입니다 — 자세한 근거는 '
+                '`docs/TARGET_ENHANCEMENT_SPEC.md` 참고. 순수 NumPy로 동작하며(`clahe` 방법만 opencv 필요), '
+                '탭 9 상단의 사각 스냅과 독립적으로 실행할 수 있습니다(같은 `fake_B` 폴더, 다른 출력 `enhanced/`).')
+            comp['enhance_input_dir'] = gr.Textbox(
+                cfg['enhance_input_dir'],
+                label='입력 폴더 직접 지정 (비우면 기본값: results_dir/name/test_<epoch>/images/fake_B)')
+            with gr.Row():
+                enh_epoch = gr.Textbox('latest', label='epoch (입력 폴더를 직접 지정하면 무시됨)')
+                enh_methods = gr.CheckboxGroup(
+                    ['unsharp', 'guided', 'clahe'], value=['unsharp', 'guided'],
+                    label='강조 방법 (순서대로 적용, clahe는 opencv 필요)')
+            with gr.Accordion('검출(CFAR) 세부 설정', open=False):
+                with gr.Row():
+                    enh_cfar_method = gr.Dropdown(
+                        ['sigma', 'ca'], value='sigma',
+                        label='CFAR 방식 (sigma=분포무관 권장, ca=고전 CA-CFAR)')
+                    enh_guard = gr.Number(2, label='guard (가드 링 반폭, px)', precision=0)
+                    enh_train = gr.Number(9, label='train (훈련 링 반폭, px)', precision=0)
+                    enh_ksigma = gr.Number(3.0, label='k_sigma (sigma 방식 임계값 배수)')
+                with gr.Row():
+                    enh_sal_window = gr.Number(5, label='saliency 윈도우 (px)', precision=0)
+                    enh_sal_floor = gr.Number(0.15, label='saliency 최소값 (오검출 억제)')
+                    enh_min_area = gr.Number(9, label='최소 영역 크기 (px²)')
+                    enh_max_frac = gr.Number(0.2, label='최대 영역 비율 (배경 제외)')
+            with gr.Accordion('강조(Enhancement) 세부 설정', open=False):
+                with gr.Row():
+                    enh_unsharp_amount = gr.Number(0.6, label='unsharp 강도 (amount)')
+                    enh_unsharp_radius = gr.Number(3, label='unsharp 반경 (px)', precision=0)
+                    enh_guided_boost = gr.Number(1.5, label='guided 디테일 증폭 (boost)')
+                    enh_guided_radius = gr.Number(5, label='guided 반경 (px)', precision=0)
+                    enh_clahe_clip = gr.Number(2.0, label='CLAHE clip_limit')
+            enh_btn = gr.Button('▶ 표적 강조 실행', variant='primary')
+            enh_status = gr.Textbox(label='결과', lines=6, interactive=False)
+            enh_gallery = gr.Gallery(label='강조된 이미지', columns=4, height='auto')
+
         # ---- Tab 10 : Hyperparameter auto-search (Successive Halving) --- #
         with gr.Tab('10. 하이퍼파라미터 자동 탐색'):
             gr.Markdown(
@@ -2315,6 +2404,13 @@ def build_ui():
                       inputs=[rect_epoch, rect_min_area, rect_max_frac, rect_min_rectangularity,
                               comp['rectify_input_dir']] + ordered_inputs,
                       outputs=[rect_status, rect_gallery])
+        enh_btn.click(cut_enhance_targets,
+                      inputs=[enh_epoch, enh_methods, enh_cfar_method, enh_guard, enh_train,
+                              enh_ksigma, enh_sal_window, enh_sal_floor, enh_min_area, enh_max_frac,
+                              enh_unsharp_amount, enh_unsharp_radius, enh_guided_boost,
+                              enh_guided_radius, enh_clahe_clip,
+                              comp['enhance_input_dir']] + ordered_inputs,
+                      outputs=[enh_status, enh_gallery])
         hps_btn.click(cut_hparam_search,
                       inputs=[hps_out, hps_n, hps_s1ep, hps_s2ep, hps_topk,
                               hps_s1img, hps_s2img, hps_ntest, hps_primary,
